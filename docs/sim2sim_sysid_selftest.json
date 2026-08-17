@@ -1,0 +1,131 @@
+{
+  "stage1_target": {
+    "r_eff": 0.0325676642084594,
+    "b_eff": 0.09548193915816724,
+    "kv": 0.04207178800824258,
+    "b_arc": 0.09692020815325059,
+    "b_arc_spread_pct": 16.22072590563688
+  },
+  "stage1_mujoco": {
+    "r_eff": 0.03255794893517264,
+    "b_eff": 0.09552506884532866,
+    "kv": 0.039066846120726056,
+    "b_arc": 0.09207968963632852,
+    "b_arc_spread_pct": 5.497881324092589
+  },
+  "stage1_error_pct": {
+    "r_eff": -0.029831041073669073,
+    "b_eff": 0.0451705186778506,
+    "kv": -7.142415451722195
+  },
+  "stage2": {
+    "armature": 0.0004337639357146025,
+    "frictionloss": 0.009644564399735076,
+    "damping": 0.03761326778014976
+  },
+  "residuals": {
+    "straight_12": {
+      "pos_rms_mm": 15.521261470642614,
+      "final_pos_mm": 27.560241896923632,
+      "yaw_rms_deg": 9.021312680388332e-14,
+      "path_length_m": 2.2962329643376274
+    },
+    "straight_20": {
+      "pos_rms_mm": 13.51632473623117,
+      "final_pos_mm": 25.423930909838077,
+      "yaw_rms_deg": 7.057315924588054e-14,
+      "path_length_m": 3.8317712061713984
+    },
+    "straight_28": {
+      "pos_rms_mm": 11.487410221766952,
+      "final_pos_mm": 22.85833099155532,
+      "yaw_rms_deg": 1.3763440434236968e-13,
+      "path_length_m": 5.348553017055339
+    },
+    "arc_d2": {
+      "pos_rms_mm": 191.97731542337985,
+      "final_pos_mm": 445.38365832891753,
+      "yaw_rms_deg": 12.713714255148501,
+      "path_length_m": 1.75134108553396
+    },
+    "arc_d4": {
+      "pos_rms_mm": 110.92181378059153,
+      "final_pos_mm": 229.60057220296827,
+      "yaw_rms_deg": 11.550161034044347,
+      "path_length_m": 0.7735450104188027
+    },
+    "arc_d6": {
+      "pos_rms_mm": 95.10286741516737,
+      "final_pos_mm": 144.69505051599486,
+      "yaw_rms_deg": 18.239079169657888,
+      "path_length_m": 0.060489050996677014
+    },
+    "spin_ccw": {
+      "pos_rms_mm": 23.592096497592514,
+      "final_pos_mm": 23.907201098334617,
+      "yaw_rms_deg": 19.444562172206005,
+      "path_length_m": 0.03637912417301216
+    },
+    "spin_cw": {
+      "pos_rms_mm": 23.592096504303413,
+      "final_pos_mm": 23.90720112247459,
+      "yaw_rms_deg": 19.444562152333216,
+      "path_length_m": 0.036379124195422365
+    },
+    "step_20": {
+      "pos_rms_mm": 2.422019430969382,
+      "final_pos_mm": 4.931219015846144,
+      "yaw_rms_deg": 1.2869347068262315e-13,
+      "path_length_m": 1.2390828830025968
+    },
+    "coast_20": {
+      "pos_rms_mm": 12.973777340546892,
+      "final_pos_mm": 19.050620455057675,
+      "yaw_rms_deg": 1.8274491561423001e-13,
+      "path_length_m": 0.9768126378444821
+    },
+    "step_arc": {
+      "pos_rms_mm": 29.598851769405023,
+      "final_pos_mm": 23.741182667774268,
+      "yaw_rms_deg": 9.579447344623139,
+      "path_length_m": 0.2595661520965821
+    },
+    "endpoint_straight": {
+      "pos_rms_mm": 10.635833132441642,
+      "final_pos_mm": 20.31233967907209,
+      "yaw_rms_deg": 7.419479262313624e-14,
+      "path_length_m": 3.1835244120824244
+    },
+    "endpoint_arc": {
+      "pos_rms_mm": 123.0402665224356,
+      "final_pos_mm": 301.39231805049826,
+      "yaw_rms_deg": 9.5814211907461,
+      "path_length_m": 1.9059600572616584
+    }
+  },
+  "endpoint_error_mm": 301.39231805049826,
+  "dr_coverage": {
+    "armature": {
+      "value": 0.0004337639357146025,
+      "range": [
+        0.0001,
+        0.0004
+      ],
+      "covered": false
+    },
+    "frictionloss": {
+      "value": 0.009644564399735076,
+      "range": [
+        0.005,
+        0.03
+      ],
+      "covered": true
+    }
+  },
+  "accepted": false,
+  "wall_clock_s": 15.003804445266724,
+  "provenance": {
+    "robot_params": "robot: duckiebot_rl.assets.params.DuckiebotParams; rates: duckiebot_rl.assets.params (rates)",
+    "dr_ranges": "duckiebot_rl.assets.params (20/23 axes; SPEC v2 S7.3 fallback for dr_base_inertia_zz_scale, dr_encoder_dropout, dr_wheel_slip_frac)"
+  }
+}

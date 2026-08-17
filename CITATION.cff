@@ -1,0 +1,51 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "duckiebot-rl: from-scratch PPO for vision-based Duckiebot lane following with clean-room assets and MuJoCo sim-to-sim verification"
+abstract: >-
+  A from-scratch PyTorch implementation of Proximal Policy Optimization that learns
+  vision-based lane following for a miniature differential-drive robot in a procedurally
+  generated, aggressively randomized city built entirely from primitives and generated
+  textures. The trained policy is transferred to an independent physics engine and renderer
+  (MuJoCo) to measure how much behaviour survives a change of simulator, and is exported to
+  ONNX for two Jetson deployment targets with an offline parity gate. No reinforcement-learning
+  library and no third-party 3D asset is used. All results are produced on a single 8 GB laptop
+  GPU under Windows.
+type: software
+authors:
+  - family-names: "T. A."
+    given-names: "Mickyas"
+repository-code: "https://github.com/MickyasTA/Issac_based_Duckiebot"
+url: "https://github.com/MickyasTA/Issac_based_Duckiebot"
+license: Apache-2.0
+version: "0.1.0.dev0"
+date-released: "2026-08-17"
+keywords:
+  - reinforcement learning
+  - proximal policy optimization
+  - sim-to-real transfer
+  - domain randomization
+  - autonomous driving
+  - Isaac Lab
+  - MuJoCo
+  - robotics
+references:
+  - type: article
+    title: "Sim-to-real reinforcement learning applied to end-to-end vehicle control"
+    authors:
+      - family-names: "Kalapos"
+        given-names: "Andras"
+      - family-names: "Gor"
+        given-names: "Csaba"
+      - family-names: "Moni"
+        given-names: "Robert"
+      - family-names: "Harmati"
+        given-names: "Istvan"
+    year: 2020
+    notes: "arXiv:2012.07461. Reward shaping (heading plus gated forward progress) is adapted from this work."
+  - type: article
+    title: "Impoola: The Power of Average Pooling for Image-Based Deep Reinforcement Learning"
+    authors:
+      - family-names: "Trumpp"
+        given-names: "Nicolas"
+    year: 2025
+    notes: "arXiv:2503.05546. The image encoder follows this design, reimplemented from the published description."

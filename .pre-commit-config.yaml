@@ -1,0 +1,51 @@
+# Pre-commit hooks. Install once per clone:
+#
+#   d:/Personal/personal/wheeled_quadruped_robot/.venv/Scripts/python.exe -m pip install pre-commit
+#   pre-commit install
+#
+# Then every commit runs ruff (lint with autofix, then format) plus the clean-room asset gate.
+# The clean-room gate is deliberately a LOCAL hook rather than a CI-only check: a Duckietown
+# mesh that reaches the history is not fixable by deleting it in a later commit.
+
+default_language_version:
+  python: python3.11
+
+repos:
+  # Pinned to the same ruff the CI lint job installs (see RUFF_VERSION in
+  # .github/workflows/ci.yml). If the two drift, pre-commit reformats a file on commit and CI
+  # then rejects the result, which is the most confusing possible way for a build to be red.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.3
+    hooks:
+      - id: ruff-check
+        name: ruff lint
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+        name: ruff format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        # Nothing large belongs in git. Weights ship as GitHub Release assets, HDRIs and
+        # generated USD are rebuilt locally.
+        args: [--maxkb=512]
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: debug-statements
+      - id: forbid-submodules
+
+  - repo: local
+    hooks:
+      - id: clean-room
+        name: clean-room asset gate (SPEC S3.4)
+        entry: python scripts/check_clean_room.py
+        language: system
+        pass_filenames: false
+        always_run: true

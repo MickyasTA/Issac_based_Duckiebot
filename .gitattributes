@@ -1,0 +1,20 @@
+# Normalize line endings. The repo is developed on Windows but CI also runs on ubuntu-latest.
+* text=auto eol=lf
+
+# Windows-only entry points keep CRLF so PowerShell and cmd never see a lone LF.
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Text asset formats: keep them diffable, they are part of the clean-room evidence.
+*.usda  text
+*.urdf  text
+*.xml   text
+*.yaml  text
+*.yml   text
+
+# Anything binary that does slip through must at least not be line-ending mangled.
+*.png   binary
+*.jpg   binary
+*.onnx  binary
+*.pt    binary

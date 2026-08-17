@@ -1,0 +1,113 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.Python
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib60/
+sdist/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Research dumps and reference material (large, and license-contaminated)
+# ---------------------------------------------------------------------------
+# _research/ holds ~1 MB of markdown plus prototype trees; _research/prototypes/db2 and
+# _research/prototypes/duckiebot contain gym-duckietown-derived meshes and MUST NEVER be
+# committed (Duckietown assets are non-commercial with no redistribution grant).
+# _refs/ holds the 32 MB reference jetbot.usd and other vendor downloads.
+_research/
+_refs/
+
+# ---------------------------------------------------------------------------
+# Generated USD, textures and other build artifacts (clean-room gate, SPEC S3.4)
+# ---------------------------------------------------------------------------
+# Only text .usda may ever be committed. Everything binary/opaque is banned outright and the
+# generated USD tree is rebuilt locally with one command.
+assets/usd/
+*.usd
+*.usdc
+*.usdz
+!*.usda
+*.obj
+*.glb
+*.gltf
+*.mtl
+*.stl
+*.dae
+*.fbx
+*.blend
+*.hdr
+*.exr
+
+# Generated marking textures (rebuilt by citygen; only the generator is committed)
+assets/textures/generated/
+
+# ---------------------------------------------------------------------------
+# Training / evaluation outputs
+# ---------------------------------------------------------------------------
+checkpoints/
+!checkpoints/README.md
+runs/
+training_results/
+logs/
+outputs/
+wandb/
+tb/
+events.out.tfevents.*
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.plan
+*.trt
+videos/
+*.mp4
+*.avi
+*.gif
+!docs/media/*.gif
+docs/results/raw/
+
+# ---------------------------------------------------------------------------
+# OS / editor
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+!.vscode/extensions.json
+*.swp
+*~

@@ -1,0 +1,89 @@
+duckiebot-rl
+Copyright 2026 Mickyas T. A.
+
+This product includes software developed by Mickyas T. A.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+================================================================================
+CLEAN-ROOM POSITION (read this before contributing any asset)
+================================================================================
+
+This repository is a CLEAN-ROOM implementation. It redistributes NO assets from the
+Duckietown project and NO assets derived from them.
+
+Specifically, and as a hard rule enforced by `scripts/check_clean_room.py` in CI:
+
+  1. No mesh, material or scene file originating from `gym-duckietown`, `duckietown-world`,
+     `dt-core` or any other Duckietown repository is present, in any form, converted or not.
+     The Duckietown asset licenses are non-commercial and grant no redistribution right,
+     so those files can never enter an Apache-2.0 repository.
+
+  2. All robot geometry is authored from primitives (boxes, cylinders, spheres, capsules) in a
+     hand-written URDF. All city geometry is generated at build time from a parametric
+     generator into text USD (`.usda`). Binary and opaque geometry container formats
+     (.obj, .glb, .gltf, .mtl, .stl, .dae, .fbx, .usd, .usdc, .usdz) are banned repository-wide.
+
+  3. All road-marking textures are generated procedurally with PIL and numpy from the
+     generator scripts in this repository. No texture is copied from any third party.
+
+  4. What IS used from public Duckietown documentation is DIMENSIONAL FACT: tile pitch,
+     lane width, tape widths and dash patterns, robot wheel radius and baseline, camera
+     placement, encoder resolution and the published control conventions. Measurements and
+     dimensions are facts and are not protected by copyright. They are cited, with their
+     provenance class, in the specification and in `docs/architecture.md`.
+
+  5. The gym-duckietown simulator, if used at all, is used ONLY as a locally installed
+     third-party referee for one optional evaluation condition (C7). It is never vendored,
+     never redistributed and never a dependency of this package.
+
+Duckietown is a trademark of its respective owners. This project is not affiliated with,
+endorsed by, or sponsored by the Duckietown Foundation. The name appears here solely to
+describe interoperability and provenance of published dimensional facts.
+
+================================================================================
+THIRD-PARTY MATERIAL
+================================================================================
+
+The following third-party material may be vendored under `assets/`. Each item is listed in
+`assets/MANIFEST.yaml` with its source and license, and the clean-room gate fails the build
+if an unlisted binary asset appears.
+
+  * AprilTag 36h11 marker images
+      Source : https://github.com/AprilRobotics/apriltag-imgs
+      License: BSD 2-Clause
+      Use    : upscaled with NEAREST sampling onto sign cards. In this project the tags are
+               VISUAL DISTRACTORS ONLY: at the trained observation resolution a 65 mm tag
+               subtends 2 to 4 pixels and is not decodable. Nothing in the pipeline detects
+               or decodes AprilTags.
+
+  * HDRI environment maps (background imagery for the dome light)
+      Source : CC0 sources only (for example Poly Haven, https://polyhaven.com)
+      License: CC0 1.0 Universal (public domain dedication)
+      Use    : background imagery and tint only, capped at six 2K files for the VRAM budget.
+               HDRI files are gitignored; a fetch script records the exact URLs and sha256.
+
+Full license texts for the above are reproduced in THIRD_PARTY_LICENSES.md.
+
+================================================================================
+UPSTREAM SOFTWARE (imported, never vendored)
+================================================================================
+
+  * NVIDIA Isaac Sim 5.1.0 and Isaac Lab 2.3.2.post1 - NVIDIA license terms, installed
+    separately by the user. Not a pip dependency of this package.
+  * MuJoCo 3.11 - Apache-2.0, installed into a separate virtual environment.
+  * PyTorch, NumPy, ONNX, ONNX Runtime, OpenCV, Pillow, PyYAML - their own permissive licenses.
+
+================================================================================
+ACADEMIC ATTRIBUTION
+================================================================================
+
+The reward shaping (heading term plus gated forward-progress term) is adapted from:
+  A. Kalapos, C. Gor, R. Moni, I. Harmati, "Sim-to-real reinforcement learning applied to
+  end-to-end vehicle control", ISMCR 2020, arXiv:2012.07461; extended in
+  ACTA IMEKO 10(3):7-14, 2021.
+
+The image encoder follows the Impoola design:
+  N. Trumpp et al., "Impoola: The Power of Average Pooling for Image-Based Deep Reinforcement
+  Learning", 2025, arXiv:2503.05546.
+
+No code from either work is copied; both are reimplemented from their published descriptions.

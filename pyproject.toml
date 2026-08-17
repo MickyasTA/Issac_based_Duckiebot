@@ -1,0 +1,191 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "duckiebot-rl"
+version = "0.1.0.dev0"
+description = "From-scratch PPO for vision-based Duckiebot lane following in a procedurally generated, clean-room miniature Duckietown (Isaac Lab + MuJoCo sim-to-sim)."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Mickyas T. A." }]
+keywords = [
+    "reinforcement-learning",
+    "ppo",
+    "isaac-lab",
+    "mujoco",
+    "sim-to-real",
+    "domain-randomization",
+    "duckiebot",
+    "robotics",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Core runtime dependencies. These are the ones needed to train PPO, run the shared
+# preprocessing chain and read configs. They are deliberately small.
+#
+# NOT LISTED ON PURPOSE (see docs/setup_windows.md):
+#   isaacsim, isaacsim-*, isaaclab, isaaclab_*  -> Isaac Sim 5.1.0 and Isaac Lab 2.3.2.post1 are
+#   NOT pip dependencies of this project. They live in a preinstalled virtual environment
+#   (d:/Personal/personal/wheeled_quadruped_robot/.venv on the development machine) and are
+#   imported behind guarded imports that raise an actionable error when absent. Adding them here
+#   would break every CPU-only job (CI, unit tests, MuJoCo sim-to-sim, ONNX export) because the
+#   Isaac wheels are multi-gigabyte, Linux/Windows CUDA specific and pinned to one Kit build.
+dependencies = [
+    "numpy>=1.26,<3",
+    "torch>=2.4",
+    "pyyaml>=6.0",
+    "pillow>=10.0",
+    "tensorboard>=2.14",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+# Developer tooling. CI installs this.
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff==0.16.3",  # exact: the formatter's stable style moves between minor releases
+    "pre-commit>=3.7",
+    "gymnasium>=1.0",
+    # matplotlib is listed here as well as in [viz] so that tests/unit/test_plots.py and
+    # tests/unit/test_dashboard.py actually run in CI instead of skipping. Without it the
+    # dashboard's degenerate-case coverage (zero rows, one row, NaN column, crashed run) would
+    # only ever be exercised on a developer machine.
+    "matplotlib>=3.8",
+]
+# MuJoCo sim-to-sim harness. Installed into the separate mujoco_venv, never into the Isaac venv.
+mujoco = [
+    "mujoco>=3.1",
+    "glfw>=2.6",
+    "PyOpenGL>=3.1",
+]
+# ONNX export and offline parity. The critic found onnxruntime was NOT installed in the Isaac
+# venv, which silently disabled the M11 parity gate; it is a hard dependency of that gate now.
+export = [
+    "onnx>=1.16",
+    "onnxruntime>=1.17",
+]
+# Offline USD authoring for the city generator. usd-core works without a Kit boot; the `pxr`
+# bindings shipped inside Isaac Sim are NOT importable from a plain venv python.
+usd = [
+    "usd-core>=24.05",
+]
+# Training dashboard and run figures. Only matplotlib: the run-directory contract itself
+# (duckiebot_rl/viz/run_dir.py) is pure standard library, so a trainer can write runs/<run_id>/
+# without this extra, and only the plotting layer degrades with an actionable ImportError.
+# Agg is forced at import time, so no GUI toolkit is ever pulled in or required.
+viz = [
+    "matplotlib>=3.8",
+]
+# Live viewer recording (scripts/live_view.py --record). Optional on purpose: the observation
+# snapshot obs/latest_obs.png is written by a standard-library PNG writer and a built-in bitmap
+# font, so it works with none of these installed; only the MP4 and GIF need them, and
+# duckiebot_rl/viz/render.py degrades to whichever encoder is present and says so. Pillow is
+# listed because it gives GIF frame durations an unambiguous millisecond meaning that imageio's
+# own GIF argument has not kept across releases.
+record = [
+    "imageio>=2.34",
+    "imageio-ffmpeg>=0.4.9",
+    "pillow>=10.0",
+]
+# OpenCV, used by the robot-side preprocessing (JPEG decode + rectification remap) and by the
+# torch-vs-cv2 preprocessing parity tests.
+cv = [
+    "opencv-python-headless>=4.9",
+]
+all = [
+    "duckiebot-rl[dev,mujoco,export,usd,cv,viz,record]",
+]
+
+[project.urls]
+Homepage = "https://github.com/MickyasTA/Issac_based_Duckiebot"
+Repository = "https://github.com/MickyasTA/Issac_based_Duckiebot"
+Issues = "https://github.com/MickyasTA/Issac_based_Duckiebot/issues"
+
+[project.scripts]
+duckiebot-export-policy = "duckiebot_rl.deploy.export_onnx:main"
+duckiebot-parity = "duckiebot_rl.deploy.parity:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["duckiebot_rl*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"duckiebot_rl" = ["py.typed", "*.yaml", "*.json"]
+
+# --------------------------------------------------------------------------------------------
+# Ruff
+# --------------------------------------------------------------------------------------------
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["_research", "_refs", "assets/usd", "outputs", "logs", "checkpoints"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+    "D",    # pydocstyle (Google convention, enforced below)
+    "ANN",  # flake8-annotations (type hints everywhere)
+    "NPY",  # numpy legacy random / API
+    "PTH",  # prefer pathlib
+    "TID",  # tidy imports
+]
+ignore = [
+    "D105",    # magic-method docstrings are noise
+    "D107",    # __init__ docstring lives on the class
+    "ANN401",  # allow typing.Any where torch/onnx APIs are genuinely dynamic
+    "B008",    # function call in default arg (argparse/dataclass idioms)
+    "SIM108",  # ternary rewrites hurt readability in numeric code
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D100", "D103", "ANN201", "ANN001"]
+"scripts/**" = ["D100"]
+"conftest.py" = ["D100", "D103"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["duckiebot_rl", "duckiebot_lab"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+# --------------------------------------------------------------------------------------------
+# Pytest
+# --------------------------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+filterwarnings = [
+    "ignore::DeprecationWarning:onnxscript.*",
+    "ignore::UserWarning:torch.onnx.*",
+]
+markers = [
+    "isaac: needs Isaac Sim 5.1 / Isaac Lab (never runs in CI; use --run-isaac)",
+    "gpu: needs a CUDA GPU (never runs in CI; use --run-gpu)",
+    "mujoco: needs the MuJoCo venv and the mujoco package (use --run-mujoco)",
+    "slow: takes more than ~30 s (use --runslow)",
+]

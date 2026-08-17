@@ -1,0 +1,183 @@
+name: CI
+
+# GPU-free, Isaac-free, robot-free continuous integration.
+#
+# Isaac Sim and Isaac Lab are NEVER installed here: they are multi-gigabyte CUDA wheels pinned
+# to one Kit build and there is no GPU runner. Everything that needs them is behind the `isaac`,
+# `gpu` and `mujoco` pytest markers, which conftest.py deselects unless explicitly opted into.
+# What remains is the part of the project that must be correct regardless of the simulator:
+# the from-scratch PPO implementation, the shared preprocessing chain, the camera math, the
+# clean-room asset gate and the whole deployment path.
+#
+# Every command below has been run locally on Windows against the development venv and seen to
+# pass before it was written here. A badge in the README is a claim; a job nobody has run is a
+# guess.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # SPEC S6.5: CI and the M4 gate run in strict fp32 (TF32 off, ratio assert at 1e-5).
+  DUCKIEBOT_RL_STRICT_FP32: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # Pinned exactly, not ">=": the ruff formatter's stable style changes between minor releases,
+  # so an unpinned install turns an unrelated ruff release into a red build on a repository
+  # nobody touched. This is the version .pre-commit-config.yaml pins too; move both together.
+  RUFF_VERSION: "0.16.3"
+
+jobs:
+  lint:
+    name: ruff (lint + format)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install ruff
+        run: python -m pip install "ruff==${RUFF_VERSION}"
+      # Ruff is platform independent and .gitattributes normalises the working tree to LF on
+      # every OS, so one canonical lint run is enough; the OS matrix lives on the tests job.
+      - name: Lint
+        run: ruff check .
+      - name: Format check
+        run: ruff format --check .
+
+  clean-room:
+    name: clean-room asset gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      # scripts/build_city.py puts the repository root on sys.path itself, so the package does
+      # not need installing here. Its only third-party needs are yaml, numpy and a USD runtime;
+      # usd-core provides `pxr` without a Kit boot. No torch: the city generator must never
+      # import it, and this job is the check that keeps it that way.
+      - name: Install the city generator dependencies
+        run: python -m pip install "pyyaml>=6.0" "numpy>=1.26" "usd-core>=24.05"
+
+      # The gate has to have something to inspect. A bare checkout holds exactly one committed
+      # asset (assets/duckiebot/duckiebot.urdf) because every generated asset is gitignored, and
+      # a gate that reads one file certifies nothing: that is precisely how it once reported
+      # PASS while 68 .usda and 117 .png files sat unread on disk. Generate the full M2 city
+      # first, then scan it.
+      - name: Generate the city (M2 asset set)
+        run: python scripts/build_city.py --all --out build/city
+
+      # SPEC S3.4. Fails the build on any mesh/binary geometry format, any Duckietown string
+      # inside an asset file, any oversized Mesh prim in a .usda, and any unmanifested PNG.
+      # This is the gate that keeps an Apache-2.0 repository legally clean.
+      #
+      # --min-files is the anti-vacuity floor. The generated tree plus the committed URDF give
+      # the gate 188 inspectable files locally; 150 is comfortably below that (so a change to
+      # the variant count cannot turn the job red on its own) and far above anything an empty
+      # or mis-excluded scan could reach. Rule 0's coverage check is the stricter half: it is
+      # derived from what is on disk, so every generated asset must actually be opened.
+      - name: Run the clean-room gate over the generated set
+        run: python scripts/check_clean_room.py --verbose --min-files 150
+
+  tests:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # CPU-only torch. Without the CPU index the linux runner pulls ~2.5 GB of CUDA wheels
+      # for a job that never touches a GPU.
+      - name: Install CPU torch
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      # dev: pytest and gymnasium (the Pendulum gate). export: onnx and onnxruntime, without
+      # which the ONNX parity tests skip themselves and the deployment path goes untested.
+      # cv: opencv-headless, which the torch-vs-cv2 preprocessing parity tests need for the
+      # comparison to happen at all.
+      - name: Install the package
+        run: python -m pip install -e ".[dev,export,cv]"
+
+      - name: Show the environment
+        run: |
+          python -c "import sys, torch, numpy; print(sys.version); print('torch', torch.__version__, 'cuda', torch.cuda.is_available()); print('numpy', numpy.__version__)"
+          python -c "import onnxruntime; print('onnxruntime', onnxruntime.__version__)"
+
+      # The default marker selection already excludes isaac/gpu/mujoco/slow (conftest.py), so
+      # this is the CPU-only suite and nothing else. It contains tests/unit/test_export.py,
+      # which is the ONNX export plus offline-parity deployment gate; running that file a
+      # second time under its own step would only pay for the same work twice.
+      - name: Unit tests
+        run: python -m pytest tests/unit -v --durations=15
+
+  ppo-gate:
+    # Its own job, not a step on `tests`: this is the single result that decides whether the
+    # from-scratch PPO claim in the README is true, and it should be readable as one green or
+    # red check rather than buried at the end of a 600-test log. It is also the only job that
+    # takes minutes, so it runs in parallel with the rest instead of extending them.
+    name: PPO learns Pendulum-v1 (M4 gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU torch
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install the package
+        run: python -m pip install -e ".[dev]"
+
+      # Not a smoke test: this is the credibility gate for a from-scratch PPO implementation.
+      # Pendulum-v1 exercises the Gaussian head, the KL-adaptive learning rate, the bounds
+      # loss and the truncation bootstrap, all of which a discrete CartPole run would skip.
+      # Two seeds, ~2 minutes on a CPU runner. DUCKIEBOT_RL_STRICT_FP32 is set workflow-wide,
+      # so the ratio assert runs at 1e-5 here.
+      - name: PPO learns Pendulum-v1
+        run: python -m pytest tests/unit/test_ppo_learns.py -v --runslow
+
+  package:
+    name: build sdist + wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # An artifact is only worth producing once every claim about the tree holds: it is clean
+    # (lint), it is correct on both operating systems (tests), it is legally shippable
+    # (clean-room) and the learning code in it actually learns (ppo-gate).
+    needs: [lint, tests, clean-room, ppo-gate]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Build
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
