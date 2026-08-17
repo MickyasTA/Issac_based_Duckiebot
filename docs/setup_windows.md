@@ -195,7 +195,9 @@ Notes that save time:
 Resume after any interruption:
 
 ```powershell
-& $ISAAC scripts/train.py --task Duckiebot-LaneFollow-v0 --num_envs 256 --headless --enable_cameras --resume checkpoints/last.pt
+& $ISAAC scripts/train.py --task Duckiebot-LaneFollow-v0 --num_envs 256 --headless --enable_cameras --resume training_results/<run_id>
+# or, for the newest run under training_results/:
+& $ISAAC scripts/train.py --task Duckiebot-LaneFollow-v0 --num_envs 256 --headless --enable_cameras --resume latest
 ```
 
 The checkpoint restores the learner exactly (bit-identical on CPU, asserted by a test) and the

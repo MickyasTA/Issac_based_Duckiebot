@@ -649,6 +649,44 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         """``(N, 48, 96, 9)`` stacked uint8 image observation, or a zero tensor in vec-only mode."""
         return self._stacked_obs
 
+    # -----------------------------------------------------------------------------------------
+    # Read-only handles for diagnostics (scripts/check_obs.py, scripts/live_view.py).
+    #
+    # They exist so that a diagnostic does not have to reach into `_robot`, `_camera`, `_d`,
+    # `_psi` or `_variant_idx`. A tool that reads privates is a tool that breaks silently the
+    # next time this class is refactored, and these five are exactly the handles every
+    # observation-side check needs.
+    # -----------------------------------------------------------------------------------------
+
+    @property
+    def robot(self) -> Any:
+        """The robot ``Articulation``, i.e. ``scene["robot"]``."""
+        return self._robot
+
+    @property
+    def onboard_camera(self) -> Any:
+        """The onboard ``TiledCamera``, or None in vec-only mode.
+
+        Named ``onboard_camera`` rather than ``camera`` because ``DirectRLEnv`` already carries a
+        ``cfg.viewer`` notion of "the camera" and a bare name would read as that one.
+        """
+        return self._camera
+
+    @property
+    def lane_offset(self) -> torch.Tensor:
+        """``(N,)`` signed lateral offset of the last snapshot, metres, positive toward yellow."""
+        return self._d
+
+    @property
+    def lane_heading_error(self) -> torch.Tensor:
+        """``(N,)`` heading error of the last snapshot, radians, positive left of the tangent."""
+        return self._psi
+
+    @property
+    def variant_index(self) -> torch.Tensor:
+        """``(N,)`` long tensor giving the city map variant each environment was spawned on."""
+        return self._variant_idx
+
     # =========================================================================================
     # Reset (SPEC v2 S6.4 order, critic item G)
     # =========================================================================================

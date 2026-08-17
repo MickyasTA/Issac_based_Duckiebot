@@ -51,6 +51,56 @@ Measured on this machine with a 2 s open-loop full-speed command: acceleration d
 0.000 m travelled and a wheel speed of 6e-9 rad/s; force drive gives 1.139 m, a wheel speed of
 18.59 rad/s, a body speed of 0.592 m/s and 1.09 mm of lateral drift, i.e. 0.96 mm/m against the
 M1 acceptance bound of 20 mm/m.
+
+The startup warning about a "non-existent path" under ``visuals`` is COSMETIC
+------------------------------------------------------------------------------
+Every launch that spawns this robot logs exactly one pair of lines that looks alarming and is
+not::
+
+    [Warning] [omni.fabric.plugin] getAttributeCount called on non-existent path
+      /World/envs/env_<N-1>/Robot/base_link/visuals/chassis_visual
+    [Warning] [omni.fabric.plugin] getTypes called on non-existent path  ...same...
+
+**What it is.** ``assets/usd/duckiebot.usda`` gives every link a ``visuals`` Xform carrying
+``instanceable = true`` and a reference to a flattened prototype (the URDF importer authors it
+that way, and it is the reason 256 robots cost one copy of the geometry instead of 256). The
+children of an instanceable prim are therefore *instance proxies*: ``chassis_visual`` and its
+siblings are composed and renderable through the instance, but the real prims live under
+``/__Prototype_<k>`` and no prim is authored at the proxy path. USD's Fabric mirror is populated
+from the real scene index, so a Fabric lookup keyed on the proxy path finds nothing and logs
+this. It is a lookup miss on a path that is not supposed to be in Fabric, not a missing robot
+part.
+
+**What was measured** (Isaac Sim 5.1, Isaac Lab 2.3.2, RTX 3080 Laptop, headless + cameras):
+
+* The census over ``--num_envs`` 2, 4, 6, 8 gives ``env_1``, ``env_3``, ``env_5``, ``env_7``:
+  always the LAST environment, never any other, and always exactly ONE pair of lines per
+  process, independent of ``N``. The prim it names varies between runs (``chassis_visual`` at
+  N = 6 and 8, ``right_wheel_visual`` at N = 2 and 4), which is the signature of a single
+  one-shot probe rather than of a per-env or per-prim traversal.
+* It is emitted after ``_setup_scene`` returns and before ``DirectRLEnv.__init__`` finishes,
+  i.e. inside ``sim.reset()``, the call that starts physics and populates Fabric for the first
+  time.
+* Clearing ``instanceable`` on the three ``visuals`` prims immediately before ``sim.reset()``
+  makes the warning disappear entirely, which pins the cause on the instancing and on nothing
+  else. It also costs 5.23 s instead of 4.05 s of environment construction at N = 4 (+29%) and
+  leaves the observation unchanged (mean 119.83 against 119.77), so it is a worse trade at every
+  N and is deliberately NOT done.
+* The last environment is not degraded. Its ``chassis_visual`` resolves
+  (``prim.IsInstanceProxy()`` is True, the world bound is non-empty, and its env-local centre and
+  size match ``env_0`` to the last printed digit); the Fabric path IS present when queried
+  through ``usdrt`` after ``sim.reset()``; and a third-person RTX render of ``env_0`` and
+  ``env_3`` placed at an identical env-local pose on an identical city stage shows the same
+  complete robot -- chassis box, marker sphere, camera housing and caster -- in both.
+* ``scripts/check_obs.py`` at N = 6 puts the warned environment's camera squarely in family with
+  the others (mean 126.8/121.2/98.8 against a 74..127 spread, 781 yellow-tape pixels, no black
+  frame, frame ring advancing).
+
+**Therefore:** ignore it. If it ever needs re-checking, the reproduction is
+``scripts/check_obs.py --num_envs <N>`` and the thing to verify is that the named environment is
+still ``env_{N-1}`` and that its row of the contact sheet still looks like the others. A warning
+that starts naming a MIDDLE environment, or that fires more than once, would mean something
+genuinely changed and is worth chasing.
 """
 
 from __future__ import annotations

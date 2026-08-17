@@ -3,10 +3,10 @@
 Run it with the Isaac Sim interpreter::
 
     & d:/Personal/personal/wheeled_quadruped_robot/.venv/Scripts/python.exe `
-        scripts/play.py --checkpoint checkpoints/<run>/best.pt --num_envs 16 --enable_cameras
+        scripts/play.py --checkpoint training_results/<run>/model_best.pth --num_envs 16 --enable_cameras
 
     # headless, held-out layouts, recording the first environment to MP4
-    & $ISAAC scripts/play.py --checkpoint checkpoints/<run>/best.pt --headless --enable_cameras `
+    & $ISAAC scripts/play.py --checkpoint training_results/<run>/model_best.pth --headless --enable_cameras `
         --eval-maps --video --video-length 900
 
 Three uses, one script:

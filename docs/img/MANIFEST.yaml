@@ -1,0 +1,29 @@
+# Provenance of every image under docs/img/.
+#
+# SPEC v2 S3.4 rule 4, enforced by scripts/check_clean_room.py: an image that cannot name the
+# script that drew it cannot be shown to be generated rather than copied, and this repository
+# ships no copied artwork. Every entry below is produced by a script in this repository from
+# assets this repository generates; none of it is traced, downloaded or photographed.
+#
+# Regenerate everything here with:
+#   & d:/Personal/personal/wheeled_quadruped_robot/.venv/Scripts/python.exe `
+#       scripts/check_obs.py --num_envs 6 --headless --enable_cameras
+generator: scripts/check_obs.py
+package: duckiebot_rl.envs
+entries:
+  docs/img/obs_check.png:
+    generator: scripts/check_obs.py
+    command: scripts/check_obs.py --num_envs 6 --headless --enable_cameras
+    content: >-
+      Contact sheet of the preprocessed policy observation. Per row: the 192x128 TiledCamera
+      render, the three 96x48 frames of the S4.3 stack (t, t-2, t-4), and the HSV yellow-tape
+      mask of the newest frame. Pixels come from the Isaac Sim rasteriser looking at the city
+      stages built by scripts/build_city.py.
+    source: rendered in Isaac Sim from build/city/usd + assets/usd/duckiebot.usda
+  docs/img/obs_check_lane.png:
+    generator: scripts/check_obs.py
+    command: scripts/check_obs.py --num_envs 6 --headless --enable_cameras
+    content: >-
+      Lane-offset sweep. One 96x48 observation per commanded signed lateral offset, used to show
+      that the lane-frame ground truth the reward integrates agrees with the rendered geometry.
+    source: rendered in Isaac Sim from build/city/usd + assets/usd/duckiebot.usda

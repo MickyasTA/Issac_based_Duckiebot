@@ -906,6 +906,13 @@ def lane_follow_env_cfg(settings: LaneFollowSettings | None = None, **overrides:
         env_spacing=base.city.env_spacing,
         # False is mandatory: USD-level per-env visual randomization needs heterogeneous envs,
         # and MultiUsdFileCfg gives each env a different city stage.
+        #
+        # Cloning this scene emits exactly one pair of
+        #   [omni.fabric.plugin] getAttributeCount / getTypes called on non-existent path
+        #   /World/envs/env_<num_envs-1>/Robot/<link>/visuals/<something>_visual
+        # during sim.reset(). It is cosmetic and it is fully characterised, with the measurements
+        # and the causal A/B, in the module docstring of duckiebot_rl/assets/robot_cfg.py. Read
+        # that before spending an evening on it. Verify with scripts/check_obs.py.
         replicate_physics=False,
         # clone_in_fabric requires replicate_physics=True, so it must be False here.
         clone_in_fabric=False,
