@@ -111,3 +111,6 @@ desktop.ini
 !.vscode/extensions.json
 *.swp
 *~
+
+# Local scratch for one-off probe scripts
+.tmp/

@@ -32,7 +32,7 @@ Terminal 2, the dashboard:
 d:/Personal/personal/wheeled_quadruped_robot/.venv/Scripts/python.exe scripts/dashboard.py --watch
 ```
 
-With no `--run`, it picks the newest directory under `./runs`. Then open
+With no `--run`, it picks the newest directory under `./training_results`. Then open
 
 ```
 runs/<run_id>/figures/latest.png
@@ -266,7 +266,7 @@ python scripts/dashboard.py --run runs/<run_id> [--watch] [--interval 20] [--onc
 
 | Flag | Meaning |
 | --- | --- |
-| `--run <dir>` | The run directory. Omit it and the newest under `--runs-root` (default `./runs`) is used. |
+| `--run <dir>` | The run directory. Omit it and the newest under `--runs-root` (default `./training_results`) is used. |
 | `--once` | Render once and exit. This is the default. |
 | `--watch` | Re-render whenever `metrics.jsonl` grows, until the run reports finished or crashed. |
 | `--interval <s>` | Poll period in watch mode; default 20 s. |

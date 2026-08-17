@@ -129,7 +129,7 @@ namespaces = true
 [tool.ruff]
 line-length = 110
 target-version = "py311"
-extend-exclude = ["_research", "_refs", "assets/usd", "outputs", "logs", "checkpoints"]
+extend-exclude = ["_research", "_refs", "assets/usd", "outputs", "logs", "checkpoints", "runs", "training_results", ".tmp"]
 
 [tool.ruff.lint]
 select = [

@@ -28,7 +28,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from duckiebot_rl.viz import dashboard as _dashboard  # noqa: E402
 from duckiebot_rl.viz.plots import matplotlib_available, require_matplotlib  # noqa: E402
-from duckiebot_rl.viz.run_dir import RunDir, find_latest_run  # noqa: E402
+from duckiebot_rl.viz.run_dir import RUNS_ROOT_DIRNAME, RunDir, find_latest_run  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,8 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--runs-root",
         type=Path,
-        default=_REPO_ROOT / "runs",
-        help="where to look for the newest run when --run is omitted (default: ./runs)",
+        default=_REPO_ROOT / RUNS_ROOT_DIRNAME,
+        help=f"where to look for the newest run when --run is omitted (default: ./{RUNS_ROOT_DIRNAME})",
     )
     parser.add_argument("--watch", action="store_true", help="re-render whenever metrics.jsonl grows")
     parser.add_argument("--once", action="store_true", help="render exactly once and exit (the default)")

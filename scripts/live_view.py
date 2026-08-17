@@ -35,10 +35,10 @@ if str(_REPO_ROOT) not in sys.path:  # pragma: no cover - convenience for a fres
 from duckiebot_rl.viz.backends import IsaacVramRefusal, isaac_vram_message, make_backend  # noqa: E402
 from duckiebot_rl.viz.policy_host import ArchitectureMismatch, PolicyHost  # noqa: E402
 from duckiebot_rl.viz.render import annotate_frame, write_rollout  # noqa: E402
-from duckiebot_rl.viz.run_dir import find_latest_run  # noqa: E402
+from duckiebot_rl.viz.run_dir import RUNS_ROOT_DIRNAME, find_latest_run  # noqa: E402
 from duckiebot_rl.viz.watcher import CheckpointInfo, CheckpointWatcher  # noqa: E402
 
-DEFAULT_RUNS_ROOT = _REPO_ROOT / "runs"
+DEFAULT_RUNS_ROOT = _REPO_ROOT / RUNS_ROOT_DIRNAME
 _STOP = False
 
 

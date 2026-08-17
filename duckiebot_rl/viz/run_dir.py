@@ -115,6 +115,13 @@ DEFAULT_SESSION = "train"
 
 CONFIG_NAME = "config.yaml"
 STATUS_NAME = "status.json"
+RUNS_ROOT_DIRNAME = "training_results"
+"""Default parent directory for run directories, per the house standard.
+
+Defined here so ``scripts/train.py``, ``scripts/dashboard.py`` and ``scripts/live_view.py`` cannot
+drift apart on where runs live.
+"""
+
 TRAIN_LOG_NAME = "train.log"
 METRICS_NAME = "metrics.jsonl"
 METRICS_DIRNAME = "metrics"

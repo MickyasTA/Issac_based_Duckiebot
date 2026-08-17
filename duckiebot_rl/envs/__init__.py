@@ -87,6 +87,8 @@ _EXPORTS: dict[str, str] = {
     "RenderingSettings": "env_cfg",
     "SpaceSettings": "env_cfg",
     "VramBudget": "env_cfg",
+    "IsaacVizEnv": "viz_env",
+    "make_viz_env": "viz_env",
     "lane_follow_env_cfg": "env_cfg",
     "vram_budget": "env_cfg",
     "DuckiebotLaneFollowEnv": "lane_follow_env",
@@ -100,6 +102,7 @@ _SUBMODULES = (
     "obstacles",
     "rewards",
     "terminations",
+    "viz_env",
 )
 
 __all__ = sorted({*_EXPORTS, *_SUBMODULES})
