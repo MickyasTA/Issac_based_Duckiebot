@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -275,6 +276,49 @@ def apply_reload(
     return True
 
 
+def _window_wanted(args: argparse.Namespace) -> bool:
+    """Resolve the tri-state window flag into a decision.
+
+    ``--window`` sets it True, ``--no-window`` False, and the default is None, which means
+    "headless unless asked". Headless is the safe default: it is what a recording run and an
+    automated check both need.
+
+    Args:
+        args: The parsed command line.
+
+    Returns:
+        True when an interactive window was explicitly requested.
+    """
+    return bool(getattr(args, "window", None))
+
+
+def _launch_isaac(headless: bool = True) -> Any:
+    """Start Isaac Kit and return the app handle.
+
+    Isaac Sim can only be configured before ``SimulationApp`` starts, which is why this runs
+    before the environment is constructed rather than inside the backend.
+
+    Args:
+        headless: Run without the Isaac UI. Rendering still happens, because the viewer needs
+            camera frames; only the editor window is suppressed.
+
+    Returns:
+        The ``SimulationApp`` handle, to be closed on the way out.
+
+    Raises:
+        ImportError: If Isaac Lab is not importable in this interpreter.
+        RuntimeError: If Kit fails to start. The usual cause on Windows is exhausted commit
+            during compute-pipeline compilation, which shows up as ``bad allocation`` inside
+            ``vkCreateComputePipelines``; free host memory or raise the pagefile.
+    """
+    from isaaclab.app import AppLauncher
+
+    print(f"[live_view] launching Isaac Sim (headless={headless}, cameras on); this takes a minute")
+    launcher = AppLauncher(headless=headless, enable_cameras=True)
+    print("[live_view] Isaac Sim up")
+    return launcher.app
+
+
 def _open_window(backend: Any, requested: bool | None) -> Any:
     """Try to open the interactive MuJoCo window.
 
@@ -284,6 +328,7 @@ def _open_window(backend: Any, requested: bool | None) -> Any:
 
     Returns:
         The passive viewer handle, or None when running headless.
+        See :func:`_window_wanted` for how the tri-state flag is resolved.
     """
     if requested is False or not hasattr(backend, "env"):
         return None
@@ -421,6 +466,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[live_view] START   {first.describe()}")
     print(f"[live_view]         {host.describe()}")
 
+    # Isaac Sim can only be configured before SimulationApp starts, so Kit has to come up BEFORE
+    # the environment is built. Keeping it here rather than at import time means the MuJoCo path
+    # never pays for it, and a fresh clone with no Isaac still runs the default backend.
+    isaac_app = None
+    if args.backend == "isaac":
+        try:
+            isaac_app = _launch_isaac(headless=not _window_wanted(args))
+        except (ImportError, RuntimeError) as exc:
+            print(f"[live_view] cannot launch Isaac Sim: {exc}", file=sys.stderr)
+            return 4
+
     try:
         backend = make_backend(
             backend=args.backend,
@@ -480,6 +536,14 @@ def main(argv: list[str] | None = None) -> int:
             if callable(with_close):
                 with_close()
         backend.close()
+        if isaac_app is not None:
+            # Kit's close() can hang on Windows after a rendering session, so bound the wait and
+            # report rather than leaving the process wedged forever.
+            closer = threading.Thread(target=isaac_app.close, daemon=True)
+            closer.start()
+            closer.join(timeout=30.0)
+            if closer.is_alive():
+                print("[live_view] note: Isaac Sim did not shut down within 30s; exiting anyway")
 
     elapsed = time.monotonic() - started
     print(f"[live_view] done: {episode} episode(s), {host.reload_count} policy load(s), {elapsed:.1f}s")
