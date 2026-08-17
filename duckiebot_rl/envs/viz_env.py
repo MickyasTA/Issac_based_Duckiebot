@@ -24,6 +24,7 @@ created, so lowering ``num_envs`` does not help. See ``docs/live_view.md``.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import numpy as np
@@ -37,20 +38,25 @@ def _require_kit() -> None:
     Raises:
         RuntimeError: If ``SimulationApp`` has not been started yet.
     """
+    # omni.kit.app is only importable once Kit has bootstrapped, and get_app().is_running() is
+    # the accessor SimulationApp.is_running itself uses (simulation_app.py:269, :861). Do NOT
+    # probe SimulationApp._instance: no such attribute exists, so the check always reports "not
+    # running" even with a perfectly healthy Kit.
     try:
-        import isaacsim  # noqa: F401
-        from isaacsim.simulation_app import SimulationApp
+        import omni.kit.app
     except ImportError as exc:  # pragma: no cover - needs Isaac Sim
         raise RuntimeError(
-            "the Isaac viewer backend needs Isaac Sim, which is not importable in this "
-            "interpreter. Use the Isaac venv:\n"
+            "Isaac Kit is not running, so 'omni.kit.app' is not importable. The app has to be "
+            "launched BEFORE the environment is built, because Isaac Sim can only be configured "
+            "pre-start. Run the viewer through scripts/live_view.py, which calls AppLauncher "
+            "first, and make sure you are using the Isaac venv:\n"
             "  d:/Personal/personal/wheeled_quadruped_robot/.venv/Scripts/python.exe"
         ) from exc
-    if getattr(SimulationApp, "_instance", None) is None:  # pragma: no cover - needs Isaac Sim
+    app = omni.kit.app.get_app()
+    if app is None or not app.is_running():  # pragma: no cover - needs Isaac Sim
         raise RuntimeError(
-            "Isaac Kit is not running. The app has to be launched BEFORE the environment is "
-            "built, because Isaac Sim can only be configured pre-start. Run the viewer through "
-            "scripts/live_view.py, which calls AppLauncher first."
+            "Isaac Kit was imported but is not running. Launch it with AppLauncher before "
+            "building the environment."
         )
 
 
@@ -136,12 +142,19 @@ class IsaacVizEnv:
 
         tensor = torch.as_tensor(np.asarray(action, dtype=np.float32), device=self.env.device)
         obs, reward, terminated, truncated, info = self.env.step(tensor.reshape(1, -1))
+        extras: dict[str, Any] = dict(info) if isinstance(info, dict) else {}
+        # The viewer reports lane deviation from info["d"], and DirectRLEnv does not populate
+        # extras["log"] the way the manager-based workflow does, so surface the signed lane
+        # offset the env already tracks. Without this the RMS is reported as a flat 0.0000.
+        offset = getattr(self.env, "_d", None)
+        if offset is not None:
+            extras.setdefault("d", float(offset[0].item()))
         return (
             self._to_numpy(obs),
             float(reward[0].item()),
             bool(terminated[0].item()),
             bool(truncated[0].item()),
-            dict(info) if isinstance(info, dict) else {},
+            extras,
         )
 
     def render_frame(self) -> np.ndarray | None:
@@ -171,6 +184,10 @@ def make_viz_env(
     num_envs: int = 1,
     device: str = "cuda:0",
     render: bool = True,
+    dynamics_dr: bool = False,
+    photometric_dr: bool = False,
+    episode_length_s: float | None = None,
+    seed: int = 0,
     **overrides: Any,
 ) -> IsaacVizEnv:
     """Build the single-environment Isaac backend the live viewer drives.
@@ -188,6 +205,11 @@ def make_viz_env(
         device: Torch device for the simulation.
         render: Whether cameras and rendering are enabled. False gives physics only, which is
             useful when the host cannot afford the RTX pipeline (see the module docstring).
+        dynamics_dr: Apply the S7.3 dynamics randomisation, which is sim-to-sim condition C6.
+        photometric_dr: Apply the visual randomisation. Named for the viewer's shared flag; it
+            maps onto ``LaneFollowSettings.visual_dr``.
+        episode_length_s: Truncation horizon in simulated seconds, or None to keep the default.
+        seed: Environment seed.
         **overrides: Extra fields forwarded to
             :func:`~duckiebot_rl.envs.env_cfg.lane_follow_env_cfg`.
 
@@ -206,8 +228,15 @@ def make_viz_env(
     settings = LaneFollowSettings(
         num_envs=1 if num_envs is None else max(1, int(num_envs)),
         device=str(device),
+        seed=int(seed),
         city=city,
+        visual_dr=bool(photometric_dr),
+        dynamics_dr=bool(dynamics_dr),
     )
+    if episode_length_s is not None:
+        settings = dataclasses.replace(
+            settings, rates=dataclasses.replace(settings.rates, episode_length_s=float(episode_length_s))
+        )
     cfg = lane_follow_env_cfg(settings, **overrides)
     env = DuckiebotLaneFollowEnv(cfg, render_mode="rgb_array" if render else None)
     adapter = IsaacVizEnv(env)

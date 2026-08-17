@@ -446,5 +446,15 @@ def make_backend(
         if not allow_isaac_vram:
             raise IsaacVramRefusal(isaac_vram_message())
         factory = _import_isaac_env_factory()
-        return factory(map=map_name, num_envs=1, device=device, render=True, **kwargs)
+        # episode_length_s and seed must be forwarded too: without them the Isaac env falls back
+        # to its own default horizon, which truncated a viewer episode after 5 steps.
+        return factory(
+            map=map_name,
+            num_envs=1,
+            device=device,
+            render=True,
+            episode_length_s=episode_length_s,
+            seed=seed,
+            **kwargs,
+        )
     raise ValueError(f"unknown backend {backend!r}; expected one of {', '.join(BACKEND_NAMES)}")

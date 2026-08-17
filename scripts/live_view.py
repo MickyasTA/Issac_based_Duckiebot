@@ -20,6 +20,7 @@ the caller understands that arithmetic.
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -547,6 +548,15 @@ def main(argv: list[str] | None = None) -> int:
 
     elapsed = time.monotonic() - started
     print(f"[live_view] done: {episode} episode(s), {host.reload_count} policy load(s), {elapsed:.1f}s")
+
+    if isaac_app is not None:
+        # Kit's teardown segfaults during interpreter shutdown on Windows, AFTER every episode has
+        # run and every artefact has been written, turning a completely successful run into exit
+        # 139. Nothing useful happens between here and process exit, so leave immediately with a
+        # truthful status. Streams are flushed first because os._exit skips buffers.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
     return 0
 
 
