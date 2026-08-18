@@ -72,6 +72,7 @@ import contextlib
 import math
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -342,6 +343,13 @@ def build_learner(settings: Any, args: argparse.Namespace) -> tuple[Any, Any]:
     )
     print(f"[train] precision: {'strict fp32 (TF32 off)' if strict else 'fp32 with TF32 kernels'}")
     learner = PPO(ActorCritic(network), cfg, device=settings.device)
+    # The two kernel-level accelerations are gated on the device and on strict mode, so what the
+    # config REQUESTED and what the learner APPLIED can differ. Print what was applied: a run that
+    # cannot say which kernels it used is a run whose timings cannot be compared with another's.
+    print(
+        f"[train] accelerations applied: channels_last={learner.channels_last} "
+        f"fused_adam={learner.fused_optimizer} checkpoint_encoder={cfg.checkpoint_encoder}"
+    )
     buffer = RolloutBuffer(
         num_steps=cfg.num_steps,
         num_envs=cfg.num_envs,
@@ -383,39 +391,75 @@ class HostSampler:
     """Samples the two host resources that actually end multi-day runs on this machine.
 
     VRAM is the headline 8 GiB constraint and the Windows commit limit is the documented killer
-    of long Isaac sessions here, so both belong in the metrics row next to the losses. Both
-    probes are subprocesses, so they run at most every :data:`_HOST_SAMPLE_PERIOD_S` seconds and
-    the previous reading is carried forward in between.
+    of long Isaac sessions here, so both belong in the metrics row next to the losses.
+
+    Both probes are subprocesses and they are SLOW: ``nvidia-smi`` plus a ``Get-CimInstance``
+    PowerShell launch were measured at 1179 ms together, which is 4 to 5% of wall time at the
+    N=64 iteration cadence when they run inline on the training thread. They therefore run on a
+    daemon thread of their own and :meth:`sample` only ever reads the last completed reading, so
+    building a metrics row costs a dict copy under a lock and never blocks the learner. The
+    readings stay on the same :data:`_HOST_SAMPLE_PERIOD_S` cadence they always had; what changed
+    is which thread pays for them.
+
+    Monitoring must never be able to end a training run, so the worker swallows every probe
+    failure and simply leaves the affected key absent.
 
     Attributes:
-        period_s: Minimum seconds between probes.
+        period_s: Seconds between probes.
     """
 
-    def __init__(self, period_s: float = _HOST_SAMPLE_PERIOD_S) -> None:
-        """Create a sampler that has never sampled.
+    def __init__(self, period_s: float = _HOST_SAMPLE_PERIOD_S, start: bool = True) -> None:
+        """Create a sampler and, by default, start its background thread.
 
         Args:
-            period_s: Minimum seconds between probes.
+            period_s: Seconds between probes.
+            start: Start the worker thread immediately. Tests pass False and drive
+                :meth:`probe_once` directly.
         """
         self.period_s = float(period_s)
-        self._last = -math.inf
         self._values: dict[str, float] = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        if start:
+            self.start()
 
-    def sample(self, force: bool = False) -> dict[str, float]:
-        """Return the current host readings, re-probing when the timer has elapsed.
+    def start(self) -> None:
+        """Start the probing thread if it is not already running."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="host-sampler", daemon=True)
+        self._thread.start()
 
-        Args:
-            force: Probe now regardless of the timer.
+    def stop(self) -> None:
+        """Ask the probing thread to finish. It is a daemon, so this is a courtesy, not a duty."""
+        self._stop.set()
+
+    def _loop(self) -> None:
+        """Probe, publish, wait, repeat, until :meth:`stop` is called."""
+        while not self._stop.is_set():
+            values = self.probe_once()
+            with self._lock:
+                self._values = values
+            self._stop.wait(self.period_s)
+
+    def sample(self) -> dict[str, float]:
+        """Return the most recent completed host readings without blocking.
 
         Returns:
             ``{"vram_nvsmi_mb": ..., "gpu_temp_c": ..., "free_commit_gb": ...}``, with any probe
-            that failed simply absent. A missing reading is never an error: monitoring must not
-            be able to end a training run.
+            that failed simply absent, and empty until the first probe has completed.
         """
-        now = time.perf_counter()
-        if not force and now - self._last < self.period_s:
+        with self._lock:
             return dict(self._values)
-        self._last = now
+
+    def probe_once(self) -> dict[str, float]:
+        """Run both probes now, on the calling thread, and return what they produced.
+
+        Returns:
+            The readings that succeeded; failures are omitted rather than raised.
+        """
         values: dict[str, float] = {}
         gpu = self._run(
             ["nvidia-smi", "--query-gpu=memory.used,temperature.gpu", "--format=csv,noheader,nounits"]
@@ -432,8 +476,7 @@ class HostSampler:
         if commit:
             with contextlib.suppress(IndexError, ValueError):
                 values["free_commit_gb"] = float(commit.split()[0]) / (1024.0 * 1024.0)
-        self._values = values
-        return dict(values)
+        return values
 
     @staticmethod
     def _run(command: list[str]) -> str:
@@ -458,7 +501,18 @@ class EpisodeTracker:
     The environment reports episode metrics as means over an iteration, which is the right shape
     for a scalar plot and the wrong shape for the house standard's per-episode CSV. This tracker
     keeps the four per-env accumulators that CSV needs and empties them on the step an env
-    finishes, so every episode is appended as it ends carrying its own ``global_step``.
+    finishes, so every episode is recorded as it ends carrying its own ``global_step``.
+
+    Nothing in the hot path synchronises with the device. The naive shape of this class asks
+    ``done.any()`` on every control step and then, on every step where an episode did end, runs a
+    ``nonzero`` and five ``.tolist()`` transfers; the campaign profile counted that among the 23.4
+    host synchronisations per step, and its cost grows with ``N`` because the fraction of steps
+    containing a reset does. Instead :meth:`update` writes the per-env accumulators into
+    preallocated ``(T, N)`` planes and a ``(T, N)`` "an episode finished here" mask, all on the
+    device, and :meth:`drain` converts the whole rollout in two transfers at the end of the
+    iteration. The training loop only ever consumes the episodes after the rollout has finished,
+    so deferring costs nothing, and the records - their contents and their order, step-major then
+    env-major - are exactly the ones the per-step version produced.
 
     Lateral deviation is read from the privileged critic vector, whose first ``vec_dim`` entries
     are the actor vector and whose next entry is ``d`` in metres (S5.2). It is sampled from the
@@ -477,32 +531,90 @@ class EpisodeTracker:
         num_envs: Parallel environment count.
         step_dt: Control period in seconds, which turns a step count into a duration.
         d_index: Index of ``d`` inside ``vec_priv``.
-        dropped: How many partial episodes have been discarded, reported at the end of training.
     """
 
-    def __init__(self, num_envs: int, device: Any, step_dt: float, d_index: int) -> None:
-        """Allocate the per-env accumulators.
+    def __init__(self, num_envs: int, device: Any, step_dt: float, d_index: int, horizon: int = 32) -> None:
+        """Allocate the per-env accumulators and the per-rollout staging planes.
 
         Args:
             num_envs: Parallel environment count.
             device: Torch device the accumulators live on.
             step_dt: Control period in seconds.
             d_index: Index of ``d`` inside ``vec_priv``, that is ``spaces.vec_dim``.
+            horizon: Expected number of :meth:`update` calls between drains, that is the rollout
+                length ``T``. The planes double if a caller exceeds it, so this is only a hint.
         """
         import torch
 
         self.num_envs = int(num_envs)
         self.step_dt = float(step_dt)
         self.d_index = int(d_index)
-        self.dropped = 0
+        self._torch = torch
+        self._device = device
         self._return = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
         self._steps = torch.zeros(self.num_envs, dtype=torch.long, device=device)
         self._d_sq = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
         self._d_max = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
         self._partial = torch.ones(self.num_envs, dtype=torch.bool, device=device)
+        self._dropped = torch.zeros((), dtype=torch.long, device=device)
+        self._cursor = 0
+        self._context: list[tuple[int, float, str]] = []
+        self._horizon = 0
+        self._allocate(max(1, int(horizon)))
+
+    def _allocate(self, horizon: int) -> None:
+        """Preallocate the staging planes for ``horizon`` control steps.
+
+        Args:
+            horizon: Number of rollout steps the planes must hold.
+        """
+        torch = self._torch
+        shape = (horizon, self.num_envs)
+        self._horizon = horizon
+        self._p_finished = torch.zeros(*shape, dtype=torch.bool, device=self._device)
+        self._p_return = torch.zeros(*shape, dtype=torch.float32, device=self._device)
+        self._p_steps = torch.zeros(*shape, dtype=torch.long, device=self._device)
+        self._p_d_sq = torch.zeros(*shape, dtype=torch.float32, device=self._device)
+        self._p_d_max = torch.zeros(*shape, dtype=torch.float32, device=self._device)
+        self._p_success = torch.zeros(*shape, dtype=torch.bool, device=self._device)
+
+    def _planes(self) -> tuple[Any, ...]:
+        """Return the staging planes in a fixed order.
+
+        Returns:
+            The six ``(T, N)`` staging tensors.
+        """
+        return (
+            self._p_finished,
+            self._p_return,
+            self._p_steps,
+            self._p_d_sq,
+            self._p_d_max,
+            self._p_success,
+        )
+
+    def _grow(self) -> None:
+        """Double the staging planes, preserving whatever has already been staged."""
+        previous, cursor, old_horizon = self._planes(), self._cursor, self._horizon
+        self._allocate(old_horizon * 2)
+        for old, new in zip(previous, self._planes(), strict=True):
+            new[:old_horizon] = old
+        self._cursor = cursor
+
+    @property
+    def dropped(self) -> int:
+        """How many partial episodes have been discarded since the tracker was built.
+
+        Reading this synchronises with the device, so the training loop reads it once, at the end,
+        rather than accumulating it on the host every step.
+
+        Returns:
+            The cumulative count of dropped partial episodes.
+        """
+        return int(self._dropped.item())
 
     def reset(self) -> None:
-        """Drop every episode in flight.
+        """Drop every episode in flight and every record not yet drained.
 
         Called after an evaluation, which steps the same environments and then resets them all:
         the episodes that were in flight before it are not episodes the training stream produced,
@@ -513,6 +625,8 @@ class EpisodeTracker:
         self._d_sq.zero_()
         self._d_max.zero_()
         self._partial.fill_(True)
+        self._cursor = 0
+        self._context.clear()
 
     def update(
         self,
@@ -522,8 +636,8 @@ class EpisodeTracker:
         truncated: Any,
         global_step: int,
         reason: str,
-    ) -> list[EpisodeRecord]:
-        """Fold one control step in and return the episodes that ended on it.
+    ) -> None:
+        """Fold one control step into the accumulators and stage any episodes that ended on it.
 
         Args:
             vec_priv: ``(N, priv_dim)`` privileged vector the policy acted on this step.
@@ -531,62 +645,88 @@ class EpisodeTracker:
             terminated: ``(N,)`` bool, a failure condition fired.
             truncated: ``(N,)`` bool, the time limit was reached.
             global_step: Total env steps consumed once this step is counted.
-            reason: Why the terminating envs terminated; see :func:`termination_reason`.
-
-        Returns:
-            The finished episodes, empty on most steps and on the ones where the only episodes
-            that ended were the partial first ones.
+            reason: Why the terminating envs terminated; see :func:`termination_reason`. It is
+                recorded for every step and read back only for the steps that produced an episode.
         """
-        import torch
+        if self._cursor >= self._horizon:
+            self._grow()
 
         deviation = vec_priv[:, self.d_index].detach().abs().to(self._d_sq.dtype)
         self._return += reward.detach().to(self._return.dtype)
         self._steps += 1
         self._d_sq += deviation * deviation
-        self._d_max = torch.maximum(self._d_max, deviation)
+        self._torch.maximum(self._d_max, deviation, out=self._d_max)
 
         done = terminated | truncated
-        if not bool(done.any()):
-            return []
-        whole = done & ~self._partial
-        self.dropped += int((done & self._partial).sum().item())
-        # Every env that just finished starts a clean episode, watched from step one.
+        # An episode counts only if the tracker watched it from step one.
+        finished = done & ~self._partial
+        self._dropped += (done & self._partial).sum()
         self._partial &= ~done
 
+        step = self._cursor
+        self._p_finished[step] = finished
+        self._p_return[step] = self._return
+        self._p_steps[step] = self._steps
+        self._p_d_sq[step] = self._d_sq
+        self._p_d_max[step] = self._d_max
+        self._p_success[step] = truncated
+        self._context.append((int(global_step), time.time(), reason))
+        self._cursor = step + 1
+
+        # The accumulators of every finished env are cleared, dropped ones included. masked_fill_
+        # rather than an index write, because building that index means a nonzero and a
+        # synchronisation for a result the host never looks at.
+        self._return.masked_fill_(done, 0.0)
+        self._steps.masked_fill_(done, 0)
+        self._d_sq.masked_fill_(done, 0.0)
+        self._d_max.masked_fill_(done, 0.0)
+
+    def drain(self) -> list[EpisodeRecord]:
+        """Return every episode that finished since the last drain and rewind the staging planes.
+
+        Returns:
+            The finished episodes in step order, then environment order. Empty when the rollout
+            produced none, or when the only episodes that ended were the partial first ones.
+        """
+        count, self._cursor = self._cursor, 0
+        context, self._context = self._context, []
+        if count == 0:
+            return []
+
+        rows = self._p_finished[:count].nonzero(as_tuple=False)
+        if rows.numel() == 0:
+            return []
+        step_index, env_index = rows[:, 0], rows[:, 1]
+        lengths = self._p_steps[step_index, env_index].to(self._p_return.dtype)
+        payload = self._torch.stack(
+            (
+                self._p_return[step_index, env_index],
+                lengths,
+                self._torch.sqrt(self._p_d_sq[step_index, env_index] / lengths.clamp(min=1.0)),
+                self._p_d_max[step_index, env_index],
+                self._p_success[step_index, env_index].to(self._p_return.dtype),
+            ),
+            dim=1,
+        ).tolist()
+        staged_at = step_index.tolist()
+
         records: list[EpisodeRecord] = []
-        ids = whole.nonzero(as_tuple=False).flatten()
-        if ids.numel():
-            lengths = self._steps[ids]
-            rms = torch.sqrt(self._d_sq[ids] / lengths.to(torch.float32).clamp(min=1.0))
-            stamp = time.time()
-            records = [
+        for (score, length, rms, peak, success), where in zip(payload, staged_at, strict=True):
+            global_step, stamp, reason = context[where]
+            reached_horizon = success > 0.5
+            records.append(
                 EpisodeRecord(
                     score=float(score),
                     steps=int(length),
                     duration=float(length) * self.step_dt,
                     global_step=global_step,
                     timestamp=stamp,
-                    lane_dev_rms=float(value),
+                    lane_dev_rms=float(rms),
                     lane_dev_max=float(peak),
-                    success=bool(success),
-                    termination_reason="truncated" if success else reason,
+                    success=reached_horizon,
+                    termination_reason="truncated" if reached_horizon else reason,
                 )
-                for score, length, value, peak, success in zip(
-                    self._return[ids].tolist(),
-                    lengths.tolist(),
-                    rms.tolist(),
-                    self._d_max[ids].tolist(),
-                    truncated[ids].tolist(),
-                    strict=True,
-                )
-            ]
-
-        # The accumulators of every finished env are cleared, dropped ones included.
-        cleared = done.nonzero(as_tuple=False).flatten()
-        self._return[cleared] = 0.0
-        self._steps[cleared] = 0
-        self._d_sq[cleared] = 0.0
-        self._d_max[cleared] = 0.0
+            )
         return records
 
 
@@ -673,13 +813,21 @@ def run_evaluation(
     learner: Any,
     steps: int,
     heartbeat: Callable[[], None] | None = None,
+    record: Any = None,
+    iteration: int = 0,
 ) -> dict[str, float]:
     """Run the S6.10 deterministic evaluation on the training envs.
 
     Training is frozen, the policy acts on its mean, the DR alphas are held where they are and
-    the per-step photometric DR is switched off. The rollout is discarded: it exists only to
-    produce the model-selection metric, which is the mean lane-frame consecutive distance in
+    the per-step photometric DR is switched off. The rollout is discarded for learning: it exists
+    to produce the model-selection metric, which is the mean lane-frame consecutive distance in
     tiles, tie-broken on collisions.
+
+    When ``record`` is given, env 0's Isaac-rendered camera frames are captured along the way and
+    written as ``videos/latest_rollout.{mp4,gif}`` plus ``obs/latest_obs.png`` in the run
+    directory. This is the Isaac view of the trained policy DURING training, at zero extra VRAM:
+    the frames are the very tiles the training camera already renders, so no second Kit process
+    is needed. The clone is mandatory; ``data.output["rgb"]`` is a view into the live buffer.
 
     Args:
         env: The environment.
@@ -687,6 +835,8 @@ def run_evaluation(
         steps: Control steps to run.
         heartbeat: Called every 50 steps so ``status.json`` does not go stale while an evaluation
             longer than the dashboard's freshness window is in progress.
+        record: The run's ``RunDir`` (or None to skip recording).
+        iteration: Training iteration, stamped onto the recorded artifacts.
 
     Returns:
         A dict of ``eval/*`` metrics; empty if no episode completed.
@@ -696,6 +846,9 @@ def run_evaluation(
     photometric_was_on = env.settings.visual_dr
     env.settings.visual_dr = False
     env.drain_episode_log()
+    frames: list[Any] = []
+    camera = getattr(env, "_camera", None) if record is not None else None
+    max_frames = 450  # one full episode at 15 Hz; caps the memory and the encode time
     try:
         with torch.no_grad():
             for step in range(steps):
@@ -706,11 +859,40 @@ def run_evaluation(
                     deterministic=True,
                 )
                 env.step(out["clipped_action"])
+                if camera is not None and len(frames) < max_frames:
+                    rgb = camera.data.output.get("rgb")
+                    if rgb is not None:
+                        frames.append(rgb[0, ..., :3].clone())
                 if heartbeat is not None and step % 50 == 0:
                     heartbeat()
         metrics = env.drain_episode_log()
     finally:
         env.settings.visual_dr = photometric_was_on
+
+    if record is not None and frames:
+        # Encode on CPU after the eval so the capture itself stays off the hot path. A failure
+        # to encode must never take training down.
+        try:
+            import numpy as np
+
+            from duckiebot_rl.viz.render import write_rollout
+
+            stack = torch.stack(frames).cpu().numpy()
+            if stack.dtype != np.uint8:
+                stack = (np.clip(stack, 0.0, 1.0) * 255.0).astype(np.uint8)
+            obs_stack = None
+            if env.settings.use_image:
+                obs_stack = env.stacked_obs[0].detach().cpu().numpy()
+            result = write_rollout(
+                record.root,
+                list(stack),
+                fps=15,
+                stacked_obs=obs_stack,
+                obs_title=f"EVAL ITER {iteration}",
+            )
+            print(f"[train] eval recording: {result.frames} Isaac frames -> videos/latest_rollout.*")
+        except Exception as exc:
+            print(f"[train] eval recording skipped: {exc!r}")
     return {f"eval/{key.split('/', 1)[-1]}": value for key, value in metrics.items()}
 
 
@@ -907,7 +1089,13 @@ def train(
     # A resume fully resets every env: PhysX state is not checkpointable (S6.9), so the
     # environment stream restores statistically while the learner restores exactly.
     env.reset()
-    tracker = EpisodeTracker(env.num_envs, settings.device, env.step_dt, settings.spaces.vec_dim)
+    tracker = EpisodeTracker(
+        env.num_envs,
+        settings.device,
+        env.step_dt,
+        settings.spaces.vec_dim,
+        horizon=buffer.num_steps,
+    )
     steps_per_iteration = buffer.num_steps * env.num_envs
     opening = (
         f"{steps_per_iteration} env-steps per iteration, {learner.cfg.minibatch_size} minibatch, "
@@ -920,7 +1108,6 @@ def train(
     while iteration < args.max_iterations:
         if args.total_steps is not None and global_step >= args.total_steps:
             break
-        finished: list[EpisodeRecord] = []
         rollout_started = time.perf_counter()
         for step in range(buffer.num_steps):
             image = env.stacked_obs if settings.use_image else None
@@ -940,16 +1127,16 @@ def train(
                 log_std=out["log_std"],
                 image=image,
             )
-            finished.extend(
-                tracker.update(
-                    vec_priv,
-                    reward,
-                    terminated,
-                    truncated,
-                    global_step + (step + 1) * env.num_envs,
-                    termination_reason(env),
-                )
+            tracker.update(
+                vec_priv,
+                reward,
+                terminated,
+                truncated,
+                global_step + (step + 1) * env.num_envs,
+                termination_reason(env),
             )
+        # One transfer for the whole rollout, instead of one host synchronisation per step.
+        finished = tracker.drain()
         rollout_seconds = time.perf_counter() - rollout_started
 
         update_started = time.perf_counter()
@@ -978,7 +1165,9 @@ def train(
         evaluation: dict[str, float] = {}
         if is_eval:
             log.status.iteration, log.status.total_timesteps = iteration, global_step
-            evaluation = run_evaluation(env, learner, args.eval_steps, heartbeat=log.heartbeat)
+            evaluation = run_evaluation(
+                env, learner, args.eval_steps, heartbeat=log.heartbeat, record=log.run, iteration=iteration
+            )
             distance = evaluation.get("eval/distance_tiles", float("nan"))
             print(f"[train] eval at it {iteration}: distance_tiles {distance:.2f}")
 
