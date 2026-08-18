@@ -60,16 +60,22 @@ from .tiles import DRIVABLE_KINDS, EDGE_BASIS, KIND_CONNECTIONS, TILE_KINDS
 
 __all__ = [
     "BUILTIN_MAP_NAMES",
+    "DIFFICULTY_NAMES",
+    "DIFFICULTY_PROFILES",
     "ENV_HALF_EXTENT_M",
     "CityMap",
+    "DifficultyProfile",
+    "LoopComplexity",
     "MapObject",
     "MapValidationError",
     "Tile",
     "builtin_map",
+    "difficulty_profile",
     "eval_maps",
     "format_tile",
     "kind_rot_for_edges",
     "load_map",
+    "loop_complexity",
     "map_from_cycle",
     "parse_tile",
     "random_loop_map",
@@ -699,6 +705,141 @@ def map_from_rows(
     ).validate()
 
 
+# ------------------------------------------------------------------- trajectory complexity
+@dataclass(frozen=True)
+class LoopComplexity:
+    """How demanding one layout's driving line is.
+
+    The definitions are those of the trajectory-complexity audit of the 68 layouts under
+    ``build/city``, so a number produced here is directly comparable with that table. A *turn* is
+    a cycle cell whose incoming and outgoing grid steps differ; a *chicane* is an adjacent
+    opposite-handed pair in the cyclic turn-only sequence, which is the pattern that forces a
+    steering reversal; the *longest straight* is the longest cyclic run of non-turning cells, and
+    a long one is where a lane-following policy can coast.
+
+    Attributes:
+        name: Map name, carried through for reporting.
+        drivable_tiles: Number of drivable cells.
+        loop_tiles: Cells on the single closed cycle, or ``0`` when the layout is not one.
+        turns: Cycle cells that change direction.
+        chicanes: Adjacent opposite-handed pairs in the cyclic turn sequence.
+        longest_straight: Longest cyclic run of consecutive straight cells.
+        intersections: Three- and four-way tiles.
+        is_loop: Whether the drivable tiles form one closed 2-regular cycle.
+        turn_sequence: One character per cycle cell, ``"L"``, ``"R"`` or ``"S"``; empty when the
+            layout is not a single closed cycle.
+    """
+
+    name: str
+    drivable_tiles: int
+    loop_tiles: int
+    turns: int
+    chicanes: int
+    longest_straight: int
+    intersections: int
+    is_loop: bool
+    turn_sequence: str
+
+    @property
+    def score(self) -> int:
+        """Aggregate difficulty: ``turns + 2 * chicanes + 3 * intersections``."""
+        return int(self.turns + 2 * self.chicanes + 3 * self.intersections)
+
+
+def _road_adjacency(city: CityMap) -> dict[tuple[int, int], list[tuple[int, int]]]:
+    """Adjacency of the drivable cells, through mutually open tile edges.
+
+    Args:
+        city: The map to walk.
+
+    Returns:
+        ``{cell: [neighbour, ...]}`` over the drivable cells only, neighbours in ``N, E, S, W``
+        edge-label order so any walk built on it is deterministic.
+    """
+    tiles = {(r, c): city.tiles[r][c] for r, c in city.drivable_cells()}
+    adjacency: dict[tuple[int, int], list[tuple[int, int]]] = {cell: [] for cell in tiles}
+    for (row, col), tile in tiles.items():
+        for edge in sorted(tile.open_edges):
+            d_row, d_col = _EDGE_STEP[edge]
+            neighbour = (row + d_row, col + d_col)
+            if neighbour in tiles and _OPPOSITE[edge] in tiles[neighbour].open_edges:
+                adjacency[(row, col)].append(neighbour)
+    return adjacency
+
+
+def loop_complexity(city: CityMap) -> LoopComplexity:
+    """Measure the trajectory complexity of a layout.
+
+    Layouts that are not a single closed cycle (the intersection maps) still report their
+    drivable-tile and intersection counts; their turn statistics are reported as ``0`` because a
+    single cyclic turn sequence is not defined for them.
+
+    Args:
+        city: The map to measure.
+
+    Returns:
+        The metrics, as a :class:`LoopComplexity`.
+    """
+    cells = city.drivable_cells()
+    intersections = sum(1 for r, c in cells if city.tiles[r][c].kind in ("threeway", "fourway"))
+    base: dict[str, Any] = {
+        "name": city.name,
+        "drivable_tiles": len(cells),
+        "intersections": intersections,
+    }
+    if not city.is_closed_loop():
+        return LoopComplexity(
+            **base,
+            loop_tiles=0,
+            turns=0,
+            chicanes=0,
+            longest_straight=0,
+            is_loop=False,
+            turn_sequence="",
+        )
+
+    adjacency = _road_adjacency(city)
+    start = min(cells)
+    cycle = [start]
+    prev, cur = start, sorted(adjacency[start])[0]
+    while cur != start:
+        cycle.append(cur)
+        prev, cur = cur, next(n for n in adjacency[cur] if n != prev)
+
+    labels: list[str] = []
+    for i, (row, col) in enumerate(cycle):
+        before, after = cycle[i - 1], cycle[(i + 1) % len(cycle)]
+        d_in = (row - before[0], col - before[1])
+        d_out = (after[0] - row, after[1] - col)
+        if d_in == d_out:
+            labels.append("S")
+            continue
+        # World axes are x = +col and y = -row, so the z component of d_in x d_out is
+        # d_in.x * d_out.y - d_in.y * d_out.x with those substitutions. Positive turns left.
+        cross = d_in[1] * (-d_out[0]) - (-d_in[0]) * d_out[1]
+        labels.append("L" if cross > 0 else "R")
+
+    turn_seq = [x for x in labels if x != "S"]
+    chicanes = (
+        sum(1 for i, x in enumerate(turn_seq) if x != turn_seq[(i + 1) % len(turn_seq)])
+        if len(turn_seq) > 1
+        else 0
+    )
+    longest = run = 0
+    for label in labels + labels:
+        run = run + 1 if label == "S" else 0
+        longest = max(longest, run)
+    return LoopComplexity(
+        **base,
+        loop_tiles=len(cycle),
+        turns=len(turn_seq),
+        chicanes=chicanes,
+        longest_straight=min(longest, labels.count("S")),
+        is_loop=True,
+        turn_sequence="".join(labels),
+    )
+
+
 # ------------------------------------------------------------------------- random generation
 def _random_spanning_tree(
     rows: int, cols: int, rng: np.random.Generator, straight_bias: float
@@ -875,6 +1016,137 @@ _RANDOM_SHAPES: Final[tuple[tuple[int, int, int], ...]] = (
 )
 
 
+#: Coarse-grid shapes the ``"hard"`` profile draws from. Every entry is a 24- or 36-tile loop
+#: inside an 8x8 grid, the largest SPEC v2 S3.3 allows. Six slots in eight are the 36-tile 8x8
+#: shape, because that is the only shape whose score ceiling (16 turns, 6 chicanes, so 28) is
+#: above the nominal set's median of 20; the two 24-tile slots keep the grid aspect ratio varied
+#: without dragging the distribution down. The two 24-tile slots sit at indices 5 and 7 so that
+#: the four eval layouts, which take shape indices 0 to 3, are all the 36-tile shape. Measured
+#: over ``variant_maps(64, difficulty="hard")``: score min 20, median 25, mean 24.5, against
+#: nominal's min 4, median 20, mean 17.5.
+_HARD_SHAPES: Final[tuple[tuple[int, int, int], ...]] = (
+    (3, 3, 1),
+    (3, 3, 1),
+    (3, 3, 1),
+    (3, 3, 1),
+    (3, 3, 1),
+    (3, 2, 1),
+    (3, 3, 1),
+    (2, 3, 1),
+)
+
+
+@dataclass(frozen=True)
+class DifficultyProfile:
+    """How the random layout generator trades trajectory complexity against gentleness.
+
+    The generator cannot simply "add a turn": a layout is a Hamiltonian cycle over the fine grid,
+    so the turn count is a property of which spanning tree was drawn rather than a free
+    parameter. The three levers that do work are the coarse shape, which fixes how many cells the
+    cycle has; ``straight_bias``, which biases the spanning-tree walk; and *selection*, which
+    draws several layouts for one slot and keeps the one that ranks best under
+    :func:`loop_complexity`. ``candidates = 1`` disables selection entirely, which is what keeps
+    the ``"nominal"`` profile bit-for-bit identical to the layouts already on disk.
+
+    Attributes:
+        name: Profile name, as accepted by :func:`difficulty_profile`.
+        shapes: Coarse ``(rows, cols, border)`` shapes cycled through by attempt index; a shape
+            ``(r, c, b)`` yields a ``(2r + 2b) x (2c + 2b)`` grid with ``4rc`` road tiles.
+        straight_bias: Forwarded to :func:`random_loop_map`; lower values grow twistier trees.
+        candidates: Layouts sampled per attempt before one is kept. ``1`` keeps the first sample,
+            which is the historical behaviour.
+        sense: ``+1`` keeps the hardest-ranked candidate, ``-1`` the gentlest.
+        straight_weight: Weight of the longest straight run in the ranking, so the hard sense
+            also avoids layouts that are mostly one long straight.
+        use_builtins: Whether the hand-authored built-ins lead the variant sequence. The hard
+            profile turns this off: ``loop_small`` has four turns and ``intersection_4way`` is
+            not a loop at all, so keeping them would put the five easiest maps in the set.
+    """
+
+    name: str
+    shapes: tuple[tuple[int, int, int], ...]
+    straight_bias: float
+    candidates: int = 1
+    sense: int = 1
+    straight_weight: float = 0.0
+    use_builtins: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate the profile.
+
+        Raises:
+            ValueError: If the profile cannot drive the generator.
+        """
+        if not self.shapes:
+            raise ValueError(f"difficulty profile {self.name!r} has no coarse shapes")
+        if self.candidates < 1:
+            raise ValueError(f"difficulty profile {self.name!r} needs candidates >= 1")
+        if self.sense not in (1, -1):
+            raise ValueError(f"difficulty profile {self.name!r} needs sense in (1, -1)")
+        if not 0.0 <= self.straight_bias <= 1.0:
+            raise ValueError(f"difficulty profile {self.name!r} needs straight_bias in [0, 1]")
+
+    def rank(self, complexity: LoopComplexity) -> float:
+        """Score one candidate layout; the highest-ranked candidate is kept.
+
+        Args:
+            complexity: Metrics of the candidate.
+
+        Returns:
+            The ranking value.
+        """
+        return float(self.sense) * (
+            complexity.score - self.straight_weight * float(complexity.longest_straight)
+        )
+
+
+#: The named difficulty profiles. ``"nominal"`` is the historical generator and must stay so:
+#: ``build/city`` was generated with it and a paused training run references those exact layouts.
+#:
+#: There is deliberately no ``"easy"`` preset. The construction's floor is already easy: the
+#: smallest loop it can emit is a 16-tile Hamiltonian cycle, which always has exactly 8 turns and
+#: 2 chicanes and so always scores 12, and the nominal set is already mostly those. A profile
+#: built from the small shapes with ``sense = -1`` was measured at 16 variants and moved the mean
+#: score from 13.6 to 12.5 with an identical median, while shrinking the pool of distinct layouts
+#: from thousands to about 38 -- a placebo that costs layout diversity. Build one with
+#: :class:`DifficultyProfile` if a curriculum genuinely needs it; it is not shipped as a name.
+DIFFICULTY_PROFILES: Final[dict[str, DifficultyProfile]] = {
+    "nominal": DifficultyProfile(name="nominal", shapes=_RANDOM_SHAPES, straight_bias=0.7),
+    "hard": DifficultyProfile(
+        name="hard",
+        shapes=_HARD_SHAPES,
+        straight_bias=0.0,
+        candidates=24,
+        sense=1,
+        straight_weight=0.5,
+        use_builtins=False,
+    ),
+}
+
+#: Difficulty names accepted on the command line, easiest first.
+DIFFICULTY_NAMES: Final[tuple[str, ...]] = ("nominal", "hard")
+
+
+def difficulty_profile(difficulty: str | DifficultyProfile) -> DifficultyProfile:
+    """Resolve a difficulty name to its profile.
+
+    Args:
+        difficulty: A name from :data:`DIFFICULTY_NAMES`, or a profile to pass through.
+
+    Returns:
+        The profile.
+
+    Raises:
+        ValueError: If the name is not one of :data:`DIFFICULTY_NAMES`.
+    """
+    if isinstance(difficulty, DifficultyProfile):
+        return difficulty
+    key = str(difficulty).strip().lower()
+    if key not in DIFFICULTY_PROFILES:
+        raise ValueError(f"unknown difficulty {difficulty!r}; expected one of {DIFFICULTY_NAMES}")
+    return DIFFICULTY_PROFILES[key]
+
+
 def _distinct_random_loop(
     name: str,
     index: int,
@@ -883,8 +1155,14 @@ def _distinct_random_loop(
     meta: dict[str, Any],
     seen: set[tuple[tuple[str, ...], ...]],
     max_attempts: int = 256,
+    profile: DifficultyProfile | None = None,
 ) -> CityMap:
     """Generate a random loop whose layout is not already in ``seen``.
+
+    Each attempt draws ``profile.candidates`` layouts from the same coarse shape, ranks them with
+    :meth:`DifficultyProfile.rank` and returns the best-ranked one that is not already taken.
+    With the nominal profile's ``candidates = 1`` that reduces to drawing exactly one layout per
+    attempt from exactly the historical seed, so nominal output is unchanged.
 
     Args:
         name: Map name.
@@ -894,24 +1172,35 @@ def _distinct_random_loop(
         meta: Metadata to attach.
         seen: Layout signatures already taken.
         max_attempts: Attempts before giving up and returning the last candidate.
+        profile: Difficulty profile; ``None`` uses the nominal one.
 
     Returns:
         A validated map, distinct from ``seen`` unless ``max_attempts`` was exhausted.
     """
+    prof = profile if profile is not None else DIFFICULTY_PROFILES["nominal"]
     city: CityMap | None = None
     for attempt in range(max_attempts):
-        rows, cols, border = _RANDOM_SHAPES[(index + attempt) % len(_RANDOM_SHAPES)]
-        city = random_loop_map(
-            name,
-            seed=seed + index * 1009 + attempt * 7919,
-            coarse_rows=rows,
-            coarse_cols=cols,
-            border=border,
-            tile_size=tile_size,
-            meta=meta,
-        )
-        if city.layout_signature() not in seen:
-            return city
+        rows, cols, border = prof.shapes[(index + attempt) % len(prof.shapes)]
+        base_seed = seed + index * 1009 + attempt * 7919
+        ranked: list[tuple[float, int, CityMap]] = []
+        for draw in range(prof.candidates):
+            candidate = random_loop_map(
+                name,
+                seed=base_seed + draw * 104729,
+                coarse_rows=rows,
+                coarse_cols=cols,
+                border=border,
+                tile_size=tile_size,
+                straight_bias=prof.straight_bias,
+                meta=meta,
+            )
+            # Sort key: best rank first, draw order breaking ties, so the pick is deterministic.
+            ranked.append((-prof.rank(loop_complexity(candidate)), draw, candidate))
+        ranked.sort(key=lambda item: (item[0], item[1]))
+        city = ranked[0][2]
+        for _, _, candidate in ranked:
+            if candidate.layout_signature() not in seen:
+                return candidate
     assert city is not None
     return city
 
@@ -1086,6 +1375,7 @@ def variant_maps(
     geometry_buckets: int = 16,
     prefix: str = "city",
     tile_sizes: Sequence[float] | None = None,
+    difficulty: str | DifficultyProfile = "nominal",
 ) -> list[CityMap]:
     """Build the deterministic set of training city variants (SPEC v2 S3.3, K = 64).
 
@@ -1104,34 +1394,44 @@ def variant_maps(
         geometry_buckets: Number of marking-geometry texture buckets to spread across.
         prefix: Filename prefix; variant ``i`` is named ``f"{prefix}_{i:03d}"``.
         tile_sizes: Tile pitches to cycle through; defaults to ``(0.570, 0.585, 0.600, 0.615)``.
+        difficulty: A name from :data:`DIFFICULTY_NAMES` or a :class:`DifficultyProfile`. The
+            default reproduces the historical generator exactly, layout for layout, which is what
+            lets ``build/city`` be regenerated byte-identically while a training run references
+            it. Non-nominal profiles record their name under the ``difficulty`` metadata key;
+            nominal deliberately does not, because writing the key would change every YAML on
+            disk.
 
     Returns:
         ``count`` validated maps with distinct layouts.
 
     Raises:
-        ValueError: If ``count`` or ``geometry_buckets`` is not positive.
+        ValueError: If ``count`` or ``geometry_buckets`` is not positive, or the difficulty is
+            not a known name.
     """
     if count <= 0 or geometry_buckets <= 0:
         raise ValueError("count and geometry_buckets must be > 0")
+    profile = difficulty_profile(difficulty)
     pitches = tuple(tile_sizes) if tile_sizes else (0.570, 0.585, 0.600, 0.615)
     out: list[CityMap] = []
     seen: set[tuple[tuple[str, ...], ...]] = set()
     for i in range(count):
         pitch = pitches[i % len(pitches)]
-        meta = {
+        meta: dict[str, Any] = {
             "variant_index": i,
             "geometry_bucket": i % geometry_buckets,
             "palette_index": i,
             "walls": (i % 3) != 0,
         }
+        if profile.name != "nominal":
+            meta["difficulty"] = profile.name
         name = f"{prefix}_{i:03d}"
-        if i < len(BUILTIN_MAP_NAMES):
+        if i < len(BUILTIN_MAP_NAMES) and profile.use_builtins:
             city = builtin_map(BUILTIN_MAP_NAMES[i], tile_size=pitch)
             city.name = name
             city.meta.update(meta)
             city.validate()
         else:
-            city = _distinct_random_loop(name, i, seed, pitch, meta, seen)
+            city = _distinct_random_loop(name, i, seed, pitch, meta, seen, profile=profile)
         seen.add(city.layout_signature())
         out.append(city)
     return out
@@ -1144,6 +1444,7 @@ def eval_maps(
     exclude: set[tuple[tuple[str, ...], ...]] | None = None,
     train_count: int = 64,
     train_seed: int = 0,
+    difficulty: str | DifficultyProfile = "nominal",
 ) -> list[CityMap]:
     """Build the frozen held-out evaluation layouts (SPEC v2 S3.3, ``eval_00 .. eval_03``).
 
@@ -1159,17 +1460,31 @@ def eval_maps(
             ``variant_maps(train_count, seed=train_seed)``.
         train_count: Training-variant count used to build the default exclusion set.
         train_seed: Training-variant seed used to build the default exclusion set.
+        difficulty: Difficulty profile for the eval layouts, and for the training set the default
+            exclusion is computed from. Held-out maps are only a fair test of the training
+            distribution when they come from the same profile, so passing ``"hard"`` here is what
+            gives a hard build genuinely hard eval maps.
 
     Returns:
         ``count`` validated maps whose layouts appear in neither the training set nor each other.
     """
+    profile = difficulty_profile(difficulty)
     if exclude is None:
-        exclude = {c.layout_signature() for c in variant_maps(train_count, seed=train_seed)}
+        exclude = {
+            c.layout_signature() for c in variant_maps(train_count, seed=train_seed, difficulty=profile)
+        }
     seen = set(exclude)
     out: list[CityMap] = []
     for i in range(count):
-        meta = {"eval": True, "geometry_bucket": 0, "palette_index": 0, "walls": i % 2 == 0}
-        city = _distinct_random_loop(f"eval_{i:02d}", i, seed, tile_size, meta, seen)
+        meta: dict[str, Any] = {
+            "eval": True,
+            "geometry_bucket": 0,
+            "palette_index": 0,
+            "walls": i % 2 == 0,
+        }
+        if profile.name != "nominal":
+            meta["difficulty"] = profile.name
+        city = _distinct_random_loop(f"eval_{i:02d}", i, seed, tile_size, meta, seen, profile=profile)
         seen.add(city.layout_signature())
         out.append(city)
     return out

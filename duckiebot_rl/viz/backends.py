@@ -24,11 +24,22 @@ and the refusal shows the arithmetic instead of saying "not supported".
 backend therefore lives behind exactly one lazy import, in :func:`_import_isaac_env_factory`, with
 a documented factory contract. It starts working the moment that module lands and fails with an
 actionable message until then. Nothing else in the viewer depends on it.
+
+One robot or a grid of them
+---------------------------
+``num_envs=1`` is the chase-camera viewer: the factory's own single-environment adapter is
+returned untouched and the viewer drives it with scalars, exactly as before. ``num_envs > 1`` is
+the parallel grid: :class:`ParallelIsaacBackend` wraps that adapter, drives the vectorized
+environment underneath it in one batched ``step`` per control tick, and leaves the whole picture
+to the Kit viewport, which is the point. See :class:`ParallelIsaacBackend` for why the grid needs
+a different layout selection than a single view does.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
+import inspect
 import os
 import shutil
 import tempfile
@@ -40,16 +51,32 @@ import numpy as np
 
 __all__ = [
     "BACKEND_NAMES",
+    "DEFAULT_ROBOT_MESH",
+    "ROBOT_MESH_NAMES",
     "IsaacVramRefusal",
     "MujocoBackend",
+    "ParallelIsaacBackend",
     "RolloutBackend",
     "isaac_vram_message",
     "make_backend",
+    "parallel_refusal_message",
     "resolve_map",
 ]
 
 BACKEND_NAMES: tuple[str, ...] = ("mujoco", "isaac")
 """Backend names accepted by :func:`make_backend`."""
+
+ROBOT_MESH_NAMES: tuple[str, ...] = ("db21j", "db17", "primitive")
+"""Robot visual meshes the Isaac backend can draw, viewer-side only.
+
+Spelled out here rather than imported from :mod:`duckiebot_rl.envs.viz_env` so that the viewer
+still imports, parses a command line and runs the MuJoCo backend on a machine with no Isaac and
+no ``duckiebot_rl.envs`` at all, which is the property the whole module is built around.
+``tests/unit/test_live_view.py`` asserts the two tuples stay identical.
+"""
+
+DEFAULT_ROBOT_MESH = "db21j"
+"""Default robot visual: the latest-generation DB21, when its glTF has been fetched."""
 
 ISAAC_TRAIN_VRAM_GIB = (6.4, 7.6)
 """Measured headless-training VRAM envelope on the target RTX 3080 Laptop, 8 GiB."""
@@ -66,9 +93,10 @@ _ISAAC_FACTORY_CANDIDATES: tuple[tuple[str, str], ...] = (
 """Where the Isaac backend looks for an environment factory, in order.
 
 Contract for whoever owns ``duckiebot_rl/envs``: expose a callable taking keyword arguments
-``map``, ``num_envs``, ``device`` and ``render`` and returning an object with ``reset(seed=None)``,
-``step(action)``, ``render_frame()``, ``close()`` and a ``control_dt`` property, matching
-:class:`RolloutBackend`. Any one of the four names above is picked up automatically.
+``map``, ``num_envs``, ``device``, ``render`` and ``robot_mesh`` and returning an object with
+``reset(seed=None)``, ``step(action)``, ``render_frame()``, ``close()`` and a ``control_dt``
+property, matching :class:`RolloutBackend`. Any one of the four names above is picked up
+automatically.
 """
 
 
@@ -403,6 +431,202 @@ def _import_isaac_env_factory() -> Any:
     )
 
 
+def parallel_refusal_message(backend: str, num_envs: int) -> str:
+    """Return the refusal text for a parallel view the requested backend cannot give.
+
+    Args:
+        backend: The backend name that was asked for.
+        num_envs: The environment count that was asked for.
+
+    Returns:
+        A message naming what parallel mode needs and what to run instead.
+    """
+    return (
+        f"--num-envs {num_envs} is an Isaac-only feature, and --backend {backend} was requested.\n"
+        "  the parallel grid is one Isaac scene holding num_envs cities side by side, each with "
+        "its own robot, all driven by one policy in one batched forward pass\n"
+        "  the MuJoCo backend is a single CPU simulation with one map and one robot; running "
+        f"{num_envs} of them would mean {num_envs} processes, not a grid\n"
+        "  use --backend isaac --allow-isaac-vram --window --num-envs "
+        f"{num_envs}, or drop --num-envs to watch one MuJoCo episode"
+    )
+
+
+class ParallelIsaacBackend:
+    """Drive every environment of a multi-city Isaac scene from one policy, for the grid view.
+
+    The single-environment adapter this wraps exists to hide the vectorized environment: it
+    reshapes one action to ``(1, act_dim)`` and returns ``reward[0]`` as a float. That is exactly
+    the wrong shape for a grid, so the grid does not use it. It reaches through the adapter's
+    documented ``env`` attribute and drives the vectorized environment in its native batched form:
+    one ``(N, act_dim)`` tensor in, ``(N, ...)`` observations out, no per-environment Python loop
+    anywhere in the step path.
+
+    Nothing is copied to the host per step. ``reward``, ``terminated`` and ``truncated`` are
+    handed back as the environment's own tensors, so the caller decides when to pay for a
+    synchronisation; the status line does, once every few seconds.
+
+    Episode bookkeeping is deliberately absent. The environment resets its own finished
+    environments inside ``step``, which is what makes the grid a continuous picture rather than N
+    episodes that all have to end before anything restarts.
+
+    Args:
+        adapter: The object the environment factory returned. Must expose ``env`` (the vectorized
+            environment), ``control_dt`` and ``close``.
+        num_envs: How many environments the scene was built with.
+
+    Attributes:
+        adapter: The wrapped factory object.
+        num_envs: Environment count.
+        name: Backend name, ``"isaac-parallel"``.
+
+    Raises:
+        RuntimeError: If the adapter exposes no vectorized ``env``.
+    """
+
+    name = "isaac-parallel"
+
+    def __init__(self, adapter: Any, num_envs: int) -> None:
+        env = getattr(adapter, "env", None)
+        if env is None:
+            raise RuntimeError(
+                "the parallel grid needs the vectorized environment underneath the viewer "
+                "adapter, which is the adapter's documented 'env' attribute, and this adapter "
+                f"({type(adapter).__name__}) has none. Run with --num-envs 1 for the "
+                "single-environment view."
+            )
+        self.adapter = adapter
+        self.env = env
+        self.num_envs = int(num_envs)
+
+    @property
+    def control_dt(self) -> float:
+        """Seconds of simulated time per :meth:`step`."""
+        return float(self.adapter.control_dt)
+
+    @staticmethod
+    def _policy_obs(obs: Any) -> Any:
+        """Unwrap the actor's half of an Isaac Lab observation dict, batch axis intact.
+
+        Args:
+            obs: What the environment returned, normally ``{"policy": {...}}``.
+
+        Returns:
+            The mapping the policy consumes, with its leading environment axis untouched.
+        """
+        if isinstance(obs, Mapping) and "policy" in obs:
+            return obs["policy"]
+        return obs
+
+    def reset(self, seed: int | None = None) -> Any:
+        """Reset every environment once.
+
+        The grid is reset exactly once, at the start. After that the environment resets finished
+        environments itself, inside :meth:`step`.
+
+        Args:
+            seed: Seed forwarded to the environment.
+
+        Returns:
+            The batched observation mapping, entries shaped ``(num_envs, ...)``.
+        """
+        obs, _info = self.env.reset(seed=seed)
+        return self._policy_obs(obs)
+
+    def step(self, actions: Any) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
+        """Advance every environment one control step with one batched action.
+
+        Args:
+            actions: An ``(num_envs, act_dim)`` array or tensor in the ``[-1, 1]`` box; it is
+                clipped here, the same way the single-environment backend clips.
+
+        Returns:
+            ``(obs, reward, terminated, truncated, info)``. The three middle entries are the
+            environment's own ``(num_envs,)`` tensors, not host scalars.
+        """
+        import torch
+
+        if isinstance(actions, torch.Tensor):
+            tensor = actions.detach().to(device=self.env.device, dtype=torch.float32)
+        else:
+            tensor = torch.as_tensor(np.asarray(actions, dtype=np.float32), device=self.env.device)
+        tensor = tensor.reshape(self.num_envs, -1).clamp(-1.0, 1.0)
+        obs, reward, terminated, truncated, info = self.env.step(tensor)
+        return (
+            self._policy_obs(obs),
+            reward,
+            terminated,
+            truncated,
+            dict(info) if isinstance(info, Mapping) else {},
+        )
+
+    def render_frame(self) -> np.ndarray | None:
+        """Return nothing: the grid's picture is the Kit viewport, not a captured frame.
+
+        A chase camera follows one robot, and there are ``num_envs`` of them. Recording a grid is
+        the training evaluation recorder's job, not the live viewer's.
+
+        Returns:
+            None, always.
+        """
+        return None
+
+    def close(self) -> None:
+        """Close the wrapped adapter, and hence the environment."""
+        with _suppress_close():
+            self.adapter.close()
+
+
+def _parallel_factory_kwargs(factory: Any, map_name: str, num_envs: int) -> dict[str, Any]:
+    """Work out what the environment factory has to be told to build a VARIED grid.
+
+    Left alone, the viewer factory pins the scene's layout list to the single stage ``--map``
+    named, because a one-environment scene is env 0 and ``MultiUsdFileCfg`` assigns assets by
+    ``index % len``. That is exactly right for one robot and exactly wrong for a grid: N
+    environments over a one-entry list is N copies of the same city.
+
+    Two ways to widen it, in order:
+
+    1. If the factory advertises an ``allow_multi`` parameter, it owns the decision; pass
+       ``allow_multi=True`` and let it choose the layouts.
+    2. Otherwise widen the selection here, through ``city``, which is a documented
+       ``LaneFollowSettings`` field the factory forwards to the config builder. The build root
+       ``--map`` resolved to is kept, so ``--map build/city_hard/maps/city_007.yaml --num-envs 64``
+       still shows the hard build; only the variant list grows, to ``city_000 .. city_{N-1}``.
+
+    Args:
+        factory: The environment factory callable.
+        map_name: The ``--map`` argument, used only to pick the build root.
+        num_envs: How many distinct layouts the grid wants.
+
+    Returns:
+        Keyword arguments to add to the factory call. Empty when neither route is available, in
+        which case the grid still runs and simply shows one layout N times.
+    """
+    try:
+        parameters = inspect.signature(factory).parameters
+    except (TypeError, ValueError):  # pragma: no cover - builtins have no signature
+        parameters = {}
+    if "allow_multi" in parameters:
+        return {"allow_multi": True}
+
+    try:
+        from duckiebot_rl.envs.viz_env import resolve_city_selection
+    except ImportError:  # pragma: no cover - a factory from somewhere else entirely
+        return {}
+    try:
+        selection = resolve_city_selection(map_name)
+        widened = dataclasses.replace(selection, num_variants=num_envs, variant_names=None)
+    except (TypeError, ValueError, FileNotFoundError, OSError) as exc:
+        print(f"[live_view] keeping the factory's own layout selection for the grid: {exc!r}")
+        return {}
+    print(
+        f"[live_view] grid layouts: city_000 .. city_{num_envs - 1:03d} from "
+        f"{getattr(widened, 'root', None) or 'the default city search roots'}"
+    )
+    return {"city": widened}
+
+
 def make_backend(
     backend: str = "mujoco",
     map_name: str = "loop_small",
@@ -411,6 +635,8 @@ def make_backend(
     allow_isaac_vram: bool = False,
     asset_dir: str | os.PathLike[str] | None = None,
     device: str = "cuda",
+    robot_mesh: str = DEFAULT_ROBOT_MESH,
+    num_envs: int = 1,
     **kwargs: Any,
 ) -> RolloutBackend:
     """Build a rollout backend by name.
@@ -423,18 +649,28 @@ def make_backend(
         allow_isaac_vram: Required to build the Isaac backend. See :func:`isaac_vram_message`.
         asset_dir: Texture directory for the MuJoCo backend.
         device: Torch/Isaac device for the Isaac backend.
+        robot_mesh: Which robot visual the Isaac scene draws, one of :data:`ROBOT_MESH_NAMES`.
+            Named explicitly rather than left to ``**kwargs`` because the MuJoCo backend has no
+            such concept and would reject the keyword.
+        num_envs: How many environments the scene holds. 1 returns the single-environment
+            adapter unchanged; anything above 1 builds the parallel grid and returns a
+            :class:`ParallelIsaacBackend`, which is Isaac-only.
         **kwargs: Extra keyword arguments forwarded to the backend constructor.
 
     Returns:
         The backend.
 
     Raises:
-        ValueError: If ``backend`` is not a known name.
+        ValueError: If ``backend`` is not a known name, or if a parallel grid is asked of the
+            MuJoCo backend.
         IsaacVramRefusal: If the Isaac backend is requested without ``allow_isaac_vram``.
         RuntimeError: If the Isaac backend is requested but ``duckiebot_rl/envs`` is absent.
     """
     name = str(backend).lower().strip()
+    count = max(1, int(num_envs))
     if name == "mujoco":
+        if count > 1:
+            raise ValueError(parallel_refusal_message(name, count))
         return MujocoBackend(
             map_name=map_name,
             episode_length_s=episode_length_s,
@@ -446,15 +682,19 @@ def make_backend(
         if not allow_isaac_vram:
             raise IsaacVramRefusal(isaac_vram_message())
         factory = _import_isaac_env_factory()
+        extra = _parallel_factory_kwargs(factory, map_name, count) if count > 1 else {}
         # episode_length_s and seed must be forwarded too: without them the Isaac env falls back
         # to its own default horizon, which truncated a viewer episode after 5 steps.
-        return factory(
+        adapter = factory(
             map=map_name,
-            num_envs=1,
+            num_envs=count,
             device=device,
             render=True,
             episode_length_s=episode_length_s,
             seed=seed,
+            robot_mesh=robot_mesh,
+            **extra,
             **kwargs,
         )
+        return adapter if count == 1 else ParallelIsaacBackend(adapter, num_envs=count)
     raise ValueError(f"unknown backend {backend!r}; expected one of {', '.join(BACKEND_NAMES)}")

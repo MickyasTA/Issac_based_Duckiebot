@@ -58,6 +58,27 @@ stdout
     Per-channel min/max/mean/std, saturated-pixel fractions, the yellow-detection rate, the
     horizon statistic, the per-step brightness trace, and the lane round-trip table.
 
+Robot visuals (``--robot-mesh``)
+-------------------------------
+``scripts/train.py`` draws the robot with the real DB21 mesh by default, so this script defaults
+to the same thing and the gate looks at what the campaign will actually render. The attachment is
+visual-only USD under links that already exist, and the robot's own geometry sits entirely inside
+the camera's 0.05 m near plane (``tests/unit/test_robot_mesh.py`` proves that vertex by vertex
+without booting Kit), so the observation should be identical to ``--robot-mesh primitive``.
+
+"Should be" is not "is": indirect lighting and the robot's own cast shadow are not geometry, and
+no offline test can rule them out. Running this script twice and diffing the two reports is what
+turns that into a measurement::
+
+    & $ISAAC scripts/check_obs.py --num_envs 6 --headless --enable_cameras `
+        --robot-mesh primitive --json docs/img/obs_primitive.json
+    & $ISAAC scripts/check_obs.py --num_envs 6 --headless --enable_cameras `
+        --robot-mesh db21j --json docs/img/obs_db21j.json
+
+``aggregate.channel_mean``, ``channel_std`` and ``horizon_top_over_bottom`` are the numbers to
+compare; they are reported to three decimals, and the same seed renders the same scene, so a
+difference beyond the last digit is the mesh reaching the policy's eye.
+
 Exit code
 ---------
 0 if every hard check passed, 1 otherwise. The hard checks are: no all-black observation, no
@@ -81,6 +102,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# numpy-only at module scope, and duckiebot_rl.envs is PEP 562 lazy, so this imports nothing from
+# Kit; the parser needs the mesh vocabulary before AppLauncher runs.
+from duckiebot_rl.envs.viz_env import DEFAULT_ROBOT_MESH, ROBOT_MESH_CHOICES  # noqa: E402
 
 DEFAULT_OUT = "docs/img/obs_check.png"
 """Contact sheet destination, relative to the repository root."""
@@ -168,6 +192,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--obstacles", action="store_true", help="spawn the S5.1 obstacle field")
     parser.add_argument("--city-root", default=None, help="directory holding the generated city USD")
     parser.add_argument("--num-variants", type=int, default=8, help="city layouts to load")
+    parser.add_argument(
+        "--robot-mesh",
+        dest="robot_mesh",
+        choices=ROBOT_MESH_CHOICES,
+        default=DEFAULT_ROBOT_MESH,
+        help="robot VISUAL only, same flag and same default as scripts/train.py. Run this script "
+        "once per value and diff the two JSON reports to measure whether the mesh reaches the "
+        "policy's eye through lighting or shadow",
+    )
     parser.add_argument("--out", default=DEFAULT_OUT, help="contact sheet destination PNG")
     parser.add_argument("--scale", type=int, default=4, help="integer magnification of each tile")
     parser.add_argument(
@@ -698,6 +731,7 @@ def main() -> int:
 
     from duckiebot_rl.envs.env_cfg import lane_follow_env_cfg
     from duckiebot_rl.envs.lane_follow_env import DuckiebotLaneFollowEnv
+    from duckiebot_rl.envs.viz_env import attach_robot_visuals
     from duckiebot_rl.sim2sim.track import write_png
 
     settings = build_settings(args)
@@ -705,6 +739,8 @@ def main() -> int:
 
     cfg = lane_follow_env_cfg(settings)
     env = DuckiebotLaneFollowEnv(cfg)
+    applied_mesh = attach_robot_visuals(env, robot_mesh=args.robot_mesh, num_envs=settings.num_envs)
+    print(f"[check_obs] robot visuals: requested {args.robot_mesh!r}, applied {applied_mesh!r}")
     env.reset()
 
     trace = settle(env, args.settle_steps)
@@ -715,7 +751,8 @@ def main() -> int:
         out_path = _REPO_ROOT / out_path
     title = (
         f"OBS CHECK  N={args.num_envs}  VISUAL DR {'ON' if args.visual_dr else 'OFF'} "
-        f"ALPHA {settings.dr_alpha_vis:.2f}  SETTLE {args.settle_steps} STEPS"
+        f"ALPHA {settings.dr_alpha_vis:.2f}  SETTLE {args.settle_steps} STEPS  "
+        f"MESH {applied_mesh.upper()}"
     )
     write_png(out_path, contact_sheet(rows, title))
     print(f"[check_obs] contact sheet written to {out_path.as_posix()}")
@@ -740,6 +777,8 @@ def main() -> int:
 
     report: dict[str, Any] = {
         "settings": settings.summary(),
+        # Recorded so that two reports being compared can never be the same mesh twice.
+        "robot_mesh": {"requested": str(args.robot_mesh), "applied": applied_mesh},
         "settle_trace": trace,
         "envs": stats,
         "aggregate": aggregate,

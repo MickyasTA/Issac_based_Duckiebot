@@ -286,6 +286,14 @@ class CitySettings:
         env_spacing: Grid spacing between envs, in metres.
         placement_half_extent: Half-extent of the per-env placement box. Everything the city
             generator emits, including off-road distractors, stays inside it.
+        variant_names: Explicit stage stems to load, in env order, instead of the generated
+            ``city_000 .. city_{num_variants - 1}`` sequence. ``None``, the default, keeps that
+            generated sequence, so a default-constructed ``CitySettings`` resolves exactly the
+            asset list it always did. The field exists for the live viewer: a single-environment
+            scene is env 0, and ``MultiUsdFileCfg`` assigns assets by ``index % len``, so env 0
+            can only ever be shown ``usd_paths[0]``. Asking for one specific layout therefore
+            means putting that layout, and only it, in the list. Must have exactly
+            ``num_variants`` entries so the two cannot drift apart.
     """
 
     root: str | None = None
@@ -296,13 +304,15 @@ class CitySettings:
     random_choice: bool = False
     env_spacing: float = 8.0
     placement_half_extent: float = 3.6
+    variant_names: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         """Validate the city settings.
 
         Raises:
-            ValueError: If ``random_choice`` is True, if a count is non-positive, or if the
-                placement box does not fit inside the env spacing.
+            ValueError: If ``random_choice`` is True, if a count is non-positive, if the
+                placement box does not fit inside the env spacing, or if ``variant_names`` is
+                given with a length other than ``num_variants``.
         """
         if self.random_choice:
             raise ValueError(
@@ -315,6 +325,11 @@ class CitySettings:
             raise ValueError(
                 f"placement box 2 x {self.placement_half_extent} m does not fit inside "
                 f"env_spacing {self.env_spacing} m"
+            )
+        if self.variant_names is not None and len(self.variant_names) != self.num_variants:
+            raise ValueError(
+                f"variant_names has {len(self.variant_names)} entries but num_variants is "
+                f"{self.num_variants}; the two describe the same list and must agree"
             )
 
 
@@ -762,7 +777,8 @@ def resolve_city_assets(city: CitySettings, include_eval: bool = False) -> tuple
     """Locate the generated city stages and their map YAMLs.
 
     Args:
-        city: City settings carrying the root and the variant count.
+        city: City settings carrying the root and either the variant count or, when
+            :attr:`CitySettings.variant_names` is set, the explicit stage stems to load.
         include_eval: Append the held-out eval layouts after the training ones.
 
     Returns:
@@ -782,7 +798,11 @@ def resolve_city_assets(city: CitySettings, include_eval: bool = False) -> tuple
         else [_repo_root() / name for name in CITY_USD_SEARCH_ROOTS]
     )
 
-    names = [f"city_{index:03d}" for index in range(city.num_variants)]
+    names = (
+        list(city.variant_names)
+        if city.variant_names is not None
+        else [f"city_{index:03d}" for index in range(city.num_variants)]
+    )
     if include_eval:
         names.extend(f"eval_{index:02d}" for index in range(city.eval_maps))
 

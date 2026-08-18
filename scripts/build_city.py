@@ -23,6 +23,12 @@ Examples:
     python scripts/build_city.py --builtin --out build/city
     python scripts/build_city.py --all --out assets/city
     python scripts/build_city.py --all --no-usd          # works without any USD runtime
+    python scripts/build_city.py --all --difficulty hard --out build/city_hard
+
+``--difficulty`` picks the trajectory-complexity profile of the procedural layouts, and
+``nominal`` is the historical generator: rebuilding with the default reproduces the existing
+layouts byte for byte. A harder or easier set therefore has to go to a different ``--out``, so
+that a training run already referencing ``build/city`` keeps the layouts it was started on.
 
 Run it with the Isaac venv python, the MuJoCo tools venv python, or any interpreter that has
 numpy and PyYAML; USD is needed only when stages are being written.
@@ -67,9 +73,23 @@ def resolve_maps(args: argparse.Namespace) -> list[city_maps.CityMap]:
     selected: list[city_maps.CityMap] = []
     if args.all:
         selected.extend(
-            city_maps.variant_maps(count=args.variants, seed=args.seed, geometry_buckets=args.buckets)
+            city_maps.variant_maps(
+                count=args.variants,
+                seed=args.seed,
+                geometry_buckets=args.buckets,
+                difficulty=args.difficulty,
+            )
         )
-        selected.extend(city_maps.eval_maps(count=args.eval_maps))
+        # The eval layouts take the same profile as the training set: held-out maps are only a
+        # fair test of a training distribution when they are drawn from it.
+        selected.extend(
+            city_maps.eval_maps(
+                count=args.eval_maps,
+                train_count=args.variants,
+                train_seed=args.seed,
+                difficulty=args.difficulty,
+            )
+        )
     if args.builtin:
         selected.extend(city_maps.builtin_map(name) for name in city_maps.BUILTIN_MAP_NAMES)
     for name in args.map or ():
@@ -231,6 +251,7 @@ def build(args: argparse.Namespace) -> int:
         "seed": args.seed,
         "alpha": args.alpha,
         "geometry_buckets": args.buckets,
+        "difficulty": args.difficulty,
         "entries": {},
     }
 
@@ -245,9 +266,16 @@ def build(args: argparse.Namespace) -> int:
             "tiles": f"{city.n_rows}x{city.n_cols}",
             "drivable": len(city.drivable_cells()),
             "closed_loop": city.is_closed_loop(),
+            "complexity_score": city_maps.loop_complexity(city).score,
             "sha256": _sha256(path),
         }
+    scores = sorted(city_maps.loop_complexity(c).score for c in selected)
+    middle = scores[len(scores) // 2]
     print(f"maps:     {len(selected)} written to {outdir / 'maps'}")
+    print(
+        f"maps:     difficulty {args.difficulty}, complexity score min {scores[0]} "
+        f"median {middle} max {scores[-1]}"
+    )
 
     if args.maps_only:
         _finish(manifest, started, manifest_path)
@@ -376,6 +404,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     select.add_argument("--list", action="store_true", help="list the built-in maps and exit")
     select.add_argument("--variants", type=int, default=64, help="training variants for --all")
     select.add_argument("--eval-maps", type=int, default=4, help="held-out eval maps for --all")
+    select.add_argument(
+        "--difficulty",
+        choices=city_maps.DIFFICULTY_NAMES,
+        default="nominal",
+        help="trajectory-complexity profile of the procedural layouts for --all. 'nominal' is "
+        "the historical generator and reproduces build/city byte for byte; 'hard' drops the "
+        "gentle built-ins, uses the 8x8 36-tile loops and keeps the twistiest of 24 candidate "
+        "layouts per slot. Send a non-nominal build to its own --out",
+    )
 
     output = parser.add_argument_group("output")
     output.add_argument("--out", default="build/city", help="output directory")

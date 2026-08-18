@@ -102,6 +102,15 @@ record = [
 cv = [
     "opencv-python-headless>=4.9",
 ]
+# Visual-mesh acquisition (scripts/fetch_visual_mesh.py). The real DB21 model is only published
+# inside Duckietown's Duckiematrix engine build, as Unity assets, so extracting it needs a Unity
+# asset reader. Nothing else in the project imports UnityPy, no test needs it, and the meshes it
+# produces are gitignored and never redistributed: this extra exists so the one script that does
+# need it can declare the dependency instead of conjuring it. The script also installs it on
+# demand into the interpreter it is run with, which is the Isaac venv in practice.
+mesh = [
+    "UnityPy>=1.10",
+]
 all = [
     "duckiebot-rl[dev,mujoco,export,usd,cv,viz,record]",
 ]

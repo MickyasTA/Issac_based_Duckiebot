@@ -17,7 +17,23 @@ The two hard launch rules of Isaac Lab are obeyed literally below:
 2. No ``isaaclab`` / ``isaacsim`` / ``omni`` import happens before ``AppLauncher(...)`` is
    constructed, other than ``from isaaclab.app import AppLauncher`` itself. Everything else is
    imported inside :func:`main`. The two ``duckiebot_rl.viz`` imports at module scope are
-   standard-library-only by construction, which is the whole point of that layer.
+   standard-library-only by construction, which is the whole point of that layer, and
+   ``duckiebot_rl.envs.viz_env`` imports nothing heavier than numpy at module scope (its Kit
+   imports all live inside function bodies) while ``duckiebot_rl.envs`` itself is PEP 562 lazy.
+   The parser needs the mesh vocabulary at import time, which is why that one is not deferred.
+
+Robot visuals
+-------------
+
+``--robot-mesh`` chooses what the robot is DRAWN as, on every one of the N environments, and
+nothing else: :func:`duckiebot_rl.envs.viz_env.attach_robot_visuals` only adds visual-only USD
+references under links that already exist and hides the environment's own visual scopes. No
+collider, rigid body, joint, mass or camera prim is touched, so the physics and the observation
+contract are identical for ``db21j``, ``db17`` and ``primitive``. The robot's own geometry also
+falls entirely inside the policy camera's 0.05 m near plane, which
+``tests/unit/test_robot_mesh.py`` proves vertex by vertex; what a mesh swap CAN still change is
+indirect lighting and the robot's own shadow, so a campaign that cares compares
+``scripts/check_obs.py --robot-mesh primitive`` against ``--robot-mesh db21j`` before it starts.
 
 Where a run goes
 ----------------
@@ -84,6 +100,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from duckiebot_rl.envs.viz_env import DEFAULT_ROBOT_MESH, ROBOT_MESH_CHOICES  # noqa: E402
 from duckiebot_rl.viz.metrics_logger import EpisodeRecord  # noqa: E402
 from duckiebot_rl.viz.run_dir import DEFAULT_RESULTS_ROOT, RunDir, find_latest_run  # noqa: E402
 
@@ -158,6 +175,16 @@ def build_parser() -> argparse.ArgumentParser:
     task.add_argument("--obstacle-stage", type=int, default=3, help="S7.4 task-curriculum stage")
     task.add_argument("--city-root", default=None, help="directory holding the generated city USD")
     task.add_argument("--num-variants", type=int, default=64, help="training city layouts")
+    task.add_argument(
+        "--robot-mesh",
+        dest="robot_mesh",
+        choices=ROBOT_MESH_CHOICES,
+        default=DEFAULT_ROBOT_MESH,
+        help="robot VISUAL only, applied to all N environments: db21j is the Duckiematrix DB21, "
+        "db17 the per-part classic meshes, primitive the environment's own boxes. Physics, "
+        "collisions, actuation and the policy camera are identical for all three; a mesh that "
+        "is not on disk downgrades to the next one instead of failing the run",
+    )
 
     schedule = parser.add_argument_group("schedule")
     schedule.add_argument("--save-interval", type=int, default=100, help="iterations between saves")
@@ -1025,12 +1052,17 @@ def train(
     from duckiebot_rl.dr.curriculum import TwoScalarADR
     from duckiebot_rl.envs.env_cfg import expected_carb_settings, lane_follow_env_cfg
     from duckiebot_rl.envs.lane_follow_env import DuckiebotLaneFollowEnv
+    from duckiebot_rl.envs.viz_env import attach_robot_visuals
     from duckiebot_rl.ppo import load_checkpoint, save_checkpoint
 
     host = HostSampler()
     print(f"[train] building the scene: {settings.num_envs} envs, {settings.city.num_variants} layouts")
     cfg = lane_follow_env_cfg(settings)
     env = DuckiebotLaneFollowEnv(cfg)
+    # Visual only, and only after the scene exists: the robots are addressed through the stage,
+    # as /World/envs/env_<i>/Robot. One line is printed per distinct outcome, not per environment.
+    applied = attach_robot_visuals(env, robot_mesh=args.robot_mesh, num_envs=settings.num_envs)
+    print(f"[train] robot visuals: requested {args.robot_mesh!r}, applied {applied!r}")
     # SPEC v2 S4.4 acceptance item 3: the antialiasing setter swallows its own exceptions, so
     # the only way to know the renderer is configured is to read carb back after launch.
     observed = env.carb_settings_readback()

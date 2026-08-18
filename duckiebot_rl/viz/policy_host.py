@@ -36,6 +36,16 @@ Determinism
 would mix policy improvement with exploration noise and make two consecutive rollouts of the same
 checkpoint incomparable. ``stochastic=True`` samples instead, for when the exploration
 distribution is what you actually want to see.
+
+One observation or many
+-----------------------
+:meth:`PolicyHost.act` is the single-environment call the chase-camera viewer uses.
+:meth:`PolicyHost.act_batch` is the same computation with the batch axis kept, for the parallel
+grid viewer that drives every environment of a 64-city grid from one policy. Both funnel through
+:meth:`PolicyHost._actions`, so the two can never drift: the actor-critic is natively batched and
+neither path loops over environments. Both accept numpy arrays and torch tensors, including the
+CUDA tensors the Isaac environment hands back, because a numpy detour through a CUDA tensor
+raises rather than copies.
 """
 
 from __future__ import annotations
@@ -527,7 +537,7 @@ class PolicyHost:
         cfg = self.network_cfg
         if "vec" not in obs:
             raise KeyError("observation has no 'vec' entry")
-        vec = torch.as_tensor(np.asarray(obs["vec"]), dtype=torch.float32, device=self.device)
+        vec = _as_tensor(obs["vec"], self.device, dtype=torch.float32)
         if vec.ndim == 1:
             vec = vec.unsqueeze(0)
         if vec.shape[-1] != cfg.vec_dim:
@@ -539,11 +549,35 @@ class PolicyHost:
         if cfg.use_image:
             if "rgb" not in obs:
                 raise KeyError("observation has no 'rgb' entry but the network uses an image encoder")
-            raw = np.asarray(obs["rgb"])
-            image = torch.as_tensor(raw, device=self.device)
+            image = _as_tensor(obs["rgb"], self.device)
             if image.ndim == 3:
                 image = image.unsqueeze(0)
         return image, vec
+
+    def _actions(self, image: torch.Tensor | None, vec: torch.Tensor, sample: bool) -> torch.Tensor:
+        """Evaluate the actor over a prepared batch and return the batched action.
+
+        The one place the policy is run. :meth:`act` and :meth:`act_batch` differ only in what
+        they do with the batch axis afterwards, which is what keeps the single-environment view
+        and the N-environment grid provably showing the same policy.
+
+        Args:
+            image: NHWC image batch, or None in vec-only mode.
+            vec: ``(B, vec_dim)`` already-normalised vector batch.
+            sample: Sample from the Gaussian instead of taking its mean.
+
+        Returns:
+            A ``(B, act_dim)`` tensor, tanh-squashed when the network config asks for it.
+        """
+        features = self.agent.actor_features(image, vec)
+        action = self.agent.policy_head.mean(features)
+        if sample:
+            log_std = self.agent.policy_head.clamped_log_std().expand_as(action)
+            noise = torch.randn(action.shape, generator=self._generator).to(action.device)
+            action = action + log_std.exp() * noise
+        if self.network_cfg.squash:
+            action = torch.tanh(action)
+        return action
 
     @torch.no_grad()
     def act(self, obs: Mapping[str, Any], stochastic: bool | None = None) -> np.ndarray:
@@ -564,17 +598,50 @@ class PolicyHost:
             raise RuntimeError("PolicyHost.act() called before any checkpoint was loaded")
         image, vec = self._prepare(obs)
         sample = self.stochastic if stochastic is None else bool(stochastic)
-        features = self.agent.actor_features(image, vec)
-        mu = self.agent.policy_head.mean(features)
-        if not sample:
-            action = mu
-        else:
-            log_std = self.agent.policy_head.clamped_log_std().expand_as(mu)
-            noise = torch.randn(mu.shape, generator=self._generator).to(mu.device)
-            action = mu + log_std.exp() * noise
-        if self.network_cfg.squash:
-            action = torch.tanh(action)
+        action = self._actions(image, vec, sample)
         return action.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+    @torch.no_grad()
+    def act_batch(self, obs: Mapping[str, Any], stochastic: bool | None = None) -> np.ndarray:
+        """Return one action per environment for a batched observation.
+
+        What the parallel grid viewer calls: N environments, one policy, one forward pass.
+        Nothing here loops over environments, because :class:`ActorCritic` is natively batched,
+        and the running vector statistics loaded from the checkpoint are the same ones
+        :meth:`act` applies, broadcast over the batch.
+
+        A batch of N copies of one observation therefore yields N copies of the action
+        :meth:`act` returns for it in deterministic mode, to float32 noise: a batch of 64 picks a
+        different GEMM kernel than a batch of 1 and the measured disagreement is around 5e-10,
+        which is the arithmetic, not a different policy. Sampled actions differ per row on
+        purpose: one draw of shape ``(N, act_dim)`` is not N draws of shape ``(1, act_dim)``.
+
+        Args:
+            obs: Observation mapping whose entries carry a leading environment axis. Numpy
+                arrays and torch tensors are both accepted, including CUDA tensors handed
+                straight out of the Isaac environment.
+            stochastic: Override the host's sampling mode for this call.
+
+        Returns:
+            An ``(N, act_dim)`` float32 array, unclipped, in the ``[-1, 1]`` action box the
+            environments expect; callers clip it.
+
+        Raises:
+            RuntimeError: If no checkpoint has been loaded.
+            ValueError: If ``vec`` carries no environment axis. Squeezing that case through
+                silently would drive env 0 and leave the other N-1 robots on stale actions.
+        """
+        if not self.loaded:
+            raise RuntimeError("PolicyHost.act_batch() called before any checkpoint was loaded")
+        if "vec" in obs and getattr(obs["vec"], "ndim", 2) != 2:
+            raise ValueError(
+                "act_batch() expects a batched 'vec' of shape (num_envs, vec_dim); got ndim="
+                f"{obs['vec'].ndim}. Use act() for a single observation."
+            )
+        image, vec = self._prepare(obs)
+        sample = self.stochastic if stochastic is None else bool(stochastic)
+        action = self._actions(image, vec, sample)
+        return action.detach().cpu().numpy().astype(np.float32)
 
     def describe(self) -> str:
         """Return a one-line description of what is loaded.
@@ -583,6 +650,32 @@ class PolicyHost:
             The current state's banner, or a note that nothing is loaded yet.
         """
         return "no checkpoint loaded" if self.state is None else self.state.describe()
+
+
+def _as_tensor(value: Any, device: torch.device, dtype: Any = None) -> torch.Tensor:
+    """Move one observation entry onto the policy device without a numpy detour.
+
+    The single-environment viewer hands numpy in. The parallel grid viewer hands the Isaac
+    environment its own CUDA tensors, and ``np.asarray`` on a CUDA tensor raises
+    ``TypeError: can't convert cuda:0 device type tensor to numpy`` rather than copying, so the
+    detour is not merely wasteful there, it is wrong.
+
+    Args:
+        value: A torch tensor, a numpy array, or anything ``np.asarray`` accepts.
+        device: Target torch device.
+        dtype: Target dtype, or None to keep the source dtype. Images keep theirs on purpose:
+            the encoder's own ``prepare`` step accepts uint8 or float32 in ``[0, 255]`` and
+            casting here would hide a wrong one.
+
+    Returns:
+        A tensor on ``device``, detached from any autograd graph.
+    """
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+        if dtype is not None:
+            return tensor.to(device=device, dtype=dtype)
+        return tensor.to(device=device)
+    return torch.as_tensor(np.asarray(value), dtype=dtype, device=device)
 
 
 def _maybe_float(value: Any) -> float | None:

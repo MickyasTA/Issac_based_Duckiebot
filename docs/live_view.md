@@ -162,13 +162,116 @@ of road), photometric randomisation cranked until the yellow dashes vanish. It i
 built-in 5x7 bitmap font and a standard-library PNG writer specifically so it has no optional
 dependency and cannot be the thing that fails.
 
+One episode encodes to one shape. On the Isaac backend the chase camera needs a render or two
+before it produces a render product, so the first frames of an episode are the robot's own
+128x192 onboard view and the rest are the 360x640 chase view; the encoders take a single shape
+per file and used to refuse the whole episode with `all frames must share one shape`. The viewer
+now reconciles the frames itself (`live_view.harmonize_frames`): the majority shape wins, a short
+leading run of odd frames is dropped, and a longer one is resampled by nearest neighbour instead.
+
 Every artefact is encoded to a sibling temporary (`latest_rollout.tmp.mp4`) and then moved into
 place atomically. The suffix is preserved because `imageio` picks its backend from the file
 extension and refuses a `.tmp` URI outright.
 
 ---
 
-## 7. Verified end to end
+## 7. Which robot you are looking at: `--robot-mesh`
+
+`--robot-mesh {db21j,db17,primitive}` picks the robot visual the Isaac backend draws. It is
+viewer-side only: the meshes are attached as pure visual references and the primitive visual
+scopes are hidden, so physics, collisions and the camera are byte-for-byte identical under all
+three and a recorded episode drives the same way whichever you choose.
+
+| Value | What is drawn | Needs |
+|---|---|---|
+| `db21j` (default, also `--db21j`) | the real latest-generation DB21, extracted from Duckietown's own Duckiematrix engine: camera mast with fisheye, Jetson devkit, top/bottom/interaction plates, LED bumpers, caster | `_refs/visual_mesh/db21j/main.obj` |
+| `db21j`, second choice | the DB18-era glTF duckietown-world publishes as `duckiebot3`, used only when the OBJ is absent and labelled as what it is on stdout | `_refs/visual_mesh/db21/main.gltf` |
+| `db17` | the older per-part DB17 OBJs, assembled and colored here because the OBJs carry no material | `chassis.obj` and friends under `_refs/visual_mesh` |
+| `primitive` | the boxes and cylinders the environment itself builds | nothing |
+
+`duckiebot3` is a misleading upstream directory name: that glTF is export_DB18's asset, not a
+DB21. The only published copy of the real DB21 is inside the Duckiematrix simulator build, which
+is why `scripts/fetch_visual_mesh.py` downloads that engine and rips the model out of its Unity
+assets with UnityPy (`pip install -e .[mesh]`, or let the script install it).
+
+The meshes derive from Duckietown CAD, are not redistributable and are therefore never committed.
+`scripts/fetch_visual_mesh.py` places them under `_refs/`. A missing mesh is not an error: the
+viewer prints what it looked for, points at the fetch script, and downgrades `db21j` to the glTF,
+then to `db17` and then to `primitive` rather than failing to start. A misspelled selector *is* an
+error, and is rejected before Kit boots so the typo costs no minutes.
+
+The same flag, the same vocabulary and the same default now exist on `scripts/train.py` and
+`scripts/check_obs.py`, where the attachment covers every one of the N environments rather than
+just env 0. `tests/unit/test_robot_mesh.py` carries the proof that the robot's own mesh cannot
+reach its own camera: every vertex falls inside the 0.05 m near plane, at the nominal camera pose
+and at every corner of the declared V10 camera randomisation box.
+
+---
+
+## 8. Watching every layout at once: `--num-envs`
+
+`--num-envs N` above 1 switches the viewer into **parallel view mode**, which is Isaac-only:
+
+```powershell
+$ISAAC = "d:/Personal/personal/wheeled_quadruped_robot/.venv/Scripts/python.exe"
+
+# 64 different cities in one scene, 64 robots, one policy, free-fly the Kit viewport over them
+& $ISAAC scripts/live_view.py --backend isaac --allow-isaac-vram --window --num-envs 64
+```
+
+One Isaac scene holds N cities side by side on the usual `env_spacing` grid, each with its own
+robot, and **one** policy drives all of them:
+`PolicyHost.act_batch(obs)` runs the actor once over an `(N, obs)` batch and returns `(N, act_dim)`.
+Nothing loops over environments; `ActorCritic` is natively batched and always was. The batch is a
+batch of the same policy the single-environment view shows: a batch of N copies of one observation
+returns N copies of the action `act()` gives for it, to float32 noise (measured disagreement about
+5e-10, which is the GEMM kernel a different batch size selects, not a different policy). That
+equality is a unit test, not a claim.
+
+What changes, and why:
+
+| | `--num-envs 1` | `--num-envs N` |
+|---|---|---|
+| Loop | one episode at a time, reset between them | reset once, then step forever |
+| Episode bookkeeping | per-episode return, lane-deviation RMS, termination reason | none: the environments reset themselves inside `step`, which is what makes the grid a continuous picture |
+| Picture | chase camera, `obs/live_frame.png` stream | the Kit viewport itself, so pass `--window` |
+| `--record` | writes `video/latest_rollout.{mp4,gif}` | **refused**, with a message: a chase camera follows one robot and there are N of them; a video of the grid is the training evaluation recorder's job |
+| `--episodes`, `--loop` | control how many episodes run | do not apply; the grid runs until Ctrl-C or the window closes |
+| Progress | one line per episode | one line every ~5 s: steps/s, env-steps/s, mean reward, resets, reloads, iteration |
+
+Hot-reload works exactly as it does for one robot, and reaches all N at once: the watcher is polled
+on a wall-clock timer (so its cadence does not change with the grid's speed), the weights are
+swapped into the same live network, and the before/after action probe prints for environment 0
+rather than 64 rows of numbers.
+
+**Varied layouts.** A single-environment scene pins the stage list to the one layout `--map` names,
+because `MultiUsdFileCfg` assigns assets by `index % len` and one environment is always index 0.
+For a grid that is exactly wrong: N environments over a one-entry list is N copies of one city.
+`backends._parallel_factory_kwargs` widens it, preferring the environment factory's own
+`allow_multi` keyword when it advertises one, and otherwise passing a `city` override that keeps
+the build root `--map` resolved to and grows the variant list to `city_000 .. city_{N-1}`. So in
+parallel mode `--map` selects the **build root** (`build/city`, `build/city_hard`, ...) rather than a
+single layout.
+
+Refusals, all before anything slow happens:
+
+```
+[live_view] --num-envs 64 is an Isaac-only feature, and --backend mujoco was requested.
+  the parallel grid is one Isaac scene holding num_envs cities side by side, each with its own
+  robot, all driven by one policy in one batched forward pass
+  ...
+```
+
+and, when Kit would come up headless, `no --window, so Kit runs headless and NOTHING appears on
+screen; add --window to actually watch the grid`.
+
+Ctrl-C and closing the window both leave through the same bounded teardown as a single-environment
+run: the loop notices `is_running()` going false, returns its summary, and `finally` closes the
+backend and joins Kit's `close()` with a 30 s bound.
+
+---
+
+## 9. Verified end to end
 
 A run directory was built with two different policies, the viewer was started in `--loop --record`
 mode against it, and `latest.pt` was swapped underneath the running process:
