@@ -274,6 +274,10 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         self._ds = torch.zeros(n, device=device)
         self._seg_id = torch.zeros(n, dtype=torch.long, device=device)
         self._arc_s = torch.zeros(n, device=device)
+        # route position of the previous step's lane match, NaN until the first post-reset
+        # query. Feeding it back constrains matching to route-continuous segments, which is
+        # what keeps d truthful when the robot leaves its lane; see BatchedLaneGraph.query.
+        self._route_pos = torch.full((n,), float("nan"), device=device)
         self._body_speed = torch.zeros(n, device=device)
         self._reward_terms: dict[str, torch.Tensor] = {}
         self._flags: TerminationFlags | None = None
@@ -600,11 +604,18 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         self._body_speed = data.root_lin_vel_b[:, 0]
         self._yaw_rate = data.root_ang_vel_b[:, 2]
 
-        query = self._lane.query(self._variant_idx, self._root_xy[:, 0], self._root_xy[:, 1], self._yaw)
+        query = self._lane.query(
+            self._variant_idx,
+            self._root_xy[:, 0],
+            self._root_xy[:, 1],
+            self._yaw,
+            prev_route_pos=self._route_pos,
+        )
         self._d = query.d
         self._psi = query.psi
         self._seg_id = query.seg_id
         self._arc_s = query.s
+        self._route_pos = self._lane.route_progress(self._variant_idx, query.seg_id, query.s)
         self._ds = progress_delta(
             self._prev_xy[:, 0],
             self._prev_xy[:, 1],
@@ -946,6 +957,7 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         self._gap[ids] = float("inf")
         self._prev_gap[ids] = float("inf")
         self._ep_distance[ids] = 0.0
+        self._route_pos[ids] = float("nan")  # first post-reset match is a free global search
         self._ep_abs_d_integral[ids] = 0.0
         self._ep_out_of_lane_integral[ids] = 0.0
         self._ep_wrong_lane_s[ids] = 0.0

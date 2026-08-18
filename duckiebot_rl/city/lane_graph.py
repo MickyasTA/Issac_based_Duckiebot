@@ -34,15 +34,24 @@ figures for a particular map.
 
 Matching
 --------
-A pose is matched to a lane by exact analytic projection onto **every** lane segment (there are
-tens, not thousands, so no spatial index or polyline sampling is needed and no discretisation
-error is introduced), choosing the segment that minimises
-``dist^2 + heading_weight * (1 - cos(psi))``. The heading term is a *tie-break*: the default
-weight of 0.002 m^2 can shift the decision by at most 0.063 m of equivalent distance, far less
-than the 0.234 m separating the two lanes of a road, so a robot that is physically in the
-right-hand lane is never matched to the oncoming lane no matter which way it is facing. That
-property is what makes the progress term direction-locked: driving backwards yields
-``psi ~ pi`` and negative ``ds`` instead of positive credit in the oncoming lane.
+A pose is matched to a lane by exact analytic projection onto lane segments (there are tens,
+not thousands, so no spatial index or polyline sampling is needed and no discretisation error is
+introduced), choosing the segment that minimises ``dist^2 + heading_weight * (1 - cos(psi))``.
+The heading term is a *tie-break*: the default weight of 0.002 m^2 can shift the decision by at
+most 0.063 m of equivalent distance, so for a robot inside its own lane the match is simply the
+nearest directed centreline.
+
+The tie-break is NOT sufficient for a robot that leaves its lane, and this is load bearing for
+the reward: the two lanes of a road are only 0.234 m apart, so a free nearest-segment search
+re-homes a robot about halfway across the centreline onto the adjacent lane, collapsing ``|d|``
+exactly when it should be growing and blinding every reward and termination term derived from
+it. At a hairpin the adjacent lane belongs to the robot's own route a few segments ahead, so a
+corner cut was reported as flawless driving plus a free jump along the route. Matching is
+therefore *continuity constrained*: callers that track poses over time pass ``prev_route_pos``,
+and the search is restricted to segments within :data:`MATCH_WINDOW_M` of route arc length,
+with a free search at spawn and as the fallback if the window ever empties. Under the window,
+``d`` stays truthful however far the robot strays, driving backwards yields ``psi ~ pi`` and
+negative ``ds``, and cutting pays its real cost.
 """
 
 from __future__ import annotations
@@ -61,6 +70,7 @@ from .tiles import EDGE_BASIS
 
 __all__ = [
     "DEFAULT_HEADING_WEIGHT",
+    "MATCH_WINDOW_M",
     "BatchedLaneGraph",
     "LaneGraph",
     "LaneQuery",
@@ -70,8 +80,20 @@ __all__ = [
     "wrap_to_pi",
 ]
 
-#: Tie-break weight on the heading term of the lane-matching cost, in metres squared.
+MATCH_WINDOW_M: Final[float] = 0.35
+"""Half-width of the route window for continuity-constrained lane matching, in metres.
+
+Chosen against the two failure directions. Too small and a legitimate fast step could leave the
+window: the robot covers at most ``v_max * dt_c`` = 0.62 * 0.067 = 0.041 m per control step, so
+0.35 m is an 8-step cushion, and even a physics glitch cannot strand the match because a window
+that excludes everything falls back to the free search. Too large and the window stops excluding
+what it exists to exclude: the apex arc of the tightest hairpin is only about 0.5 m of route, so
+a window much above that lets a mid-cut robot be matched to the post-apex return lane it has not
+yet earned, which is the d-collapsing re-home this window was built to prevent.
+"""
+
 DEFAULT_HEADING_WEIGHT: Final[float] = 0.002
+"""Tie-break weight on the heading term of the lane-matching cost, in metres squared."""
 
 _OPPOSITE: Final[dict[str, str]] = {"N": "S", "S": "N", "E": "W", "W": "E"}
 _EDGE_STEP: Final[dict[str, tuple[int, int]]] = {"N": (-1, 0), "S": (1, 0), "E": (0, 1), "W": (0, -1)}
@@ -434,6 +456,8 @@ class LaneGraph:
         heading_weight: float = DEFAULT_HEADING_WEIGHT,
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
+        prev_route_pos: torch.Tensor | None = None,
+        window_m: float = MATCH_WINDOW_M,
     ) -> LaneQuery:
         """Query this single map. See :meth:`BatchedLaneGraph.query`.
 
@@ -444,6 +468,9 @@ class LaneGraph:
             heading_weight: Tie-break weight in metres squared.
             device: Torch device; defaults to CPU.
             dtype: Floating dtype.
+            prev_route_pos: Previous route positions for continuity-constrained matching, or
+                None/NaN entries for a free search; see :meth:`BatchedLaneGraph.query`.
+            window_m: Route half-width of the window in metres.
 
         Returns:
             The lane query result.
@@ -457,7 +484,15 @@ class LaneGraph:
         batched = self._batched
         n = torch.as_tensor(x, dtype=dtype, device=batched.device).reshape(-1).numel()
         variant = torch.zeros(n, dtype=torch.long, device=batched.device)
-        return batched.query(variant, x, y, yaw, heading_weight=heading_weight)
+        return batched.query(
+            variant,
+            x,
+            y,
+            yaw,
+            heading_weight=heading_weight,
+            prev_route_pos=prev_route_pos,
+            window_m=window_m,
+        )
 
 
 class BatchedLaneGraph:
@@ -565,6 +600,19 @@ class BatchedLaneGraph:
             dtype=dtype,
             device=self.device,
         )
+        self.variant_has_route = torch.tensor([g.has_route for g in self.graphs], device=self.device)
+
+        # loop circumference per variant; 1.0 (not 0) where there is no route so that the
+        # windowed-matching remainder below never divides by zero on intersection maps, where
+        # the window is masked off anyway
+        def _loop_length(g: LaneGraph) -> float:
+            if not g.has_route:
+                return 1.0
+            return max(g.route_offsets[si] + seg.length for si, seg in enumerate(g.segments))
+
+        self.route_length = torch.tensor(
+            [_loop_length(g) for g in self.graphs], dtype=dtype, device=self.device
+        )
 
     # ------------------------------------------------------------------------------- helpers
     def _as_batch(self, value: Any) -> torch.Tensor:
@@ -579,6 +627,8 @@ class BatchedLaneGraph:
         y: Any,
         yaw: Any,
         heading_weight: float = DEFAULT_HEADING_WEIGHT,
+        prev_route_pos: torch.Tensor | None = None,
+        window_m: float = MATCH_WINDOW_M,
     ) -> LaneQuery:
         """Match a batch of poses to lanes and return the reward ground truth.
 
@@ -588,6 +638,19 @@ class BatchedLaneGraph:
             y: ``(B,)`` world y in metres.
             yaw: ``(B,)`` heading in radians, counter-clockwise from ``+x``.
             heading_weight: Tie-break weight in metres squared; see the module docstring.
+            prev_route_pos: ``(B,)`` route position (:meth:`route_progress`) each environment was
+                matched to on the PREVIOUS step, or ``None``/NaN entries for a free global match.
+                When given, matching is constrained to segments within ``window_m`` of it along
+                the directed route. This is what makes ``d`` truthful when the robot leaves its
+                lane: without it, the nearest-segment search re-homes a robot that crosses the
+                centreline onto the adjacent lane of the route, so ``|d|`` collapses exactly when
+                it should be growing, every reward term derived from it goes blind, and cutting a
+                hairpin is reported as flawless driving a few segments further along. Measured on
+                ``city_000`` before the window existed: crossing the centreline flipped
+                ``seg_id`` 2 to 3 and collapsed ``|d|`` 0.103 m to 0.003 m.
+            window_m: Half-width of the allowed route interval in metres. The default clears one
+                tile comfortably while keeping the return lane of a hairpin, one lane separation
+                away in space but several tiles away along the route, out of reach.
 
         Returns:
             A :class:`LaneQuery` whose fields all have shape ``(B,)``.
@@ -662,6 +725,22 @@ class BatchedLaneGraph:
         psi_all = wrap_to_pi(yaw_t[:, None] - torch.atan2(tan_y, tan_x))
         cost = dist2 + heading_weight * (1.0 - torch.cos(psi_all))
         cost = torch.where(valid, cost, torch.full_like(cost, float("inf")))
+        if prev_route_pos is not None:
+            prev = self._as_batch(prev_route_pos)
+            length = self.route_length[vidx].unsqueeze(1)
+            candidate = self.seg_route_s[vidx] + s_all
+            ahead = torch.remainder(candidate - prev[:, None], length)
+            circular = torch.minimum(ahead, length - ahead)
+            constrain = (
+                torch.isfinite(prev)[:, None]
+                & self.variant_has_route[vidx].unsqueeze(1)
+                & (circular > window_m)
+            )
+            windowed = torch.where(constrain, torch.full_like(cost, float("inf")), cost)
+            # a window that excludes every segment (teleport, giant integration step) must fall
+            # back to the free match rather than return garbage from an all-inf argmin
+            stuck = torch.isinf(windowed).all(dim=1, keepdim=True)
+            cost = torch.where(stuck, cost, windowed)
         best = torch.argmin(cost, dim=1)
 
         rows = torch.arange(px.numel(), device=self.device)

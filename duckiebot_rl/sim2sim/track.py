@@ -323,6 +323,16 @@ def load_map(source: str | Path | dict[str, Any] | MapSpec) -> MapSpec:
     )
 
 
+MATCH_WINDOW_M: float = 0.35
+"""Route half-width for continuity-constrained lane matching, in metres.
+
+The same value and the same reasoning as ``duckiebot_rl.city.lane_graph.MATCH_WINDOW_M``: an
+8-step cushion at full speed, small enough that the post-apex return lane of a hairpin stays
+unmatchable until the robot has actually driven the arc. The two simulators must window
+identically or the sim-to-sim reward comparison (C6) measures the matcher, not the policy.
+"""
+
+
 # ------------------------------------------------------------------------------------ lane graph
 @dataclass(frozen=True)
 class LaneQuery:
@@ -550,7 +560,61 @@ class LaneGraph:
         return successors
 
     # -- queries ------------------------------------------------------------------------------
-    def query(self, x: float, y: float, yaw: float, lookahead: float = 0.3) -> LaneQuery:
+    def allowed_window(self, segment: int, s: float, window_m: float = MATCH_WINDOW_M) -> set[int]:
+        """Return the segment indices reachable within ``window_m`` of route from ``(segment, s)``.
+
+        The window always contains the current segment (side-slip changes ``d``, not ``s``), the
+        predecessor chain within the window (the projection clamp can walk ``s`` slightly
+        backwards through a corner), and the successor chain as far as ``window_m`` ahead.
+
+        Args:
+            segment: index of the currently matched segment.
+            s: arc length along it, in metres.
+            window_m: route half-width of the window, in metres.
+
+        Returns:
+            The allowed segment indices.
+        """
+        # Strict budget, mirroring the Isaac-side circular route window exactly: a segment is
+        # allowed only if some part of it lies within window_m of route distance from (segment,
+        # s). Adding the remaining current-segment length on top, the obvious-looking variant,
+        # lets the post-hairpin flank into the window from mid-segment on small maps, which is
+        # precisely the re-home the window exists to prevent (caught by the 3x2 ring test).
+        allowed = {segment}
+        ahead = self.segments[segment].length - s
+        index = segment
+        for _ in range(len(self.segments)):
+            if ahead >= window_m:
+                break
+            nxt = self._successors[index]
+            if nxt < 0 or nxt in allowed:
+                break
+            allowed.add(nxt)
+            ahead += self.segments[nxt].length
+            index = nxt
+        behind = s
+        index = segment
+        predecessors = {succ: idx for idx, succ in enumerate(self._successors) if succ >= 0}
+        for _ in range(len(self.segments)):
+            if behind >= window_m:
+                break
+            prev = predecessors.get(index, -1)
+            if prev < 0 or prev in allowed:
+                break
+            allowed.add(prev)
+            behind += self.segments[prev].length
+            index = prev
+        return allowed
+
+    def query(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        lookahead: float = 0.3,
+        prev_match: tuple[int, float] | None = None,
+        window_m: float = MATCH_WINDOW_M,
+    ) -> LaneQuery:
         """Project a pose onto the nearest directed lane centre.
 
         Args:
@@ -558,6 +622,12 @@ class LaneGraph:
             y: world y in metres.
             yaw: robot heading in radians.
             lookahead: distance ahead at which the reported curvature is evaluated, in metres.
+            prev_match: ``(segment, s)`` of the previous step's match, or None for a free global
+                search. When given, matching is constrained to :meth:`allowed_window` around it,
+                mirroring the Isaac-side route window: without the constraint a robot crossing
+                the centreline is re-homed onto the adjacent lane and ``|d|`` collapses exactly
+                when it should grow, which is how hairpin cutting goes unmeasured.
+            window_m: route half-width of the window, in metres.
 
         Returns:
             The :class:`LaneQuery`.
@@ -567,36 +637,74 @@ class LaneGraph:
         """
         if not self.segments:
             raise RuntimeError(f"map {self.map.name!r} produced no lane segments")
+        if prev_match is not None:
+            allowed = self.allowed_window(prev_match[0], prev_match[1], window_m)
+            result = self._query_free(x, y, yaw, lookahead, allowed)
+            if result is not None:
+                return result
+        result = self._query_free(x, y, yaw, lookahead, None)
+        if result is None:  # pragma: no cover - self.segments is non-empty here
+            raise RuntimeError(f"map {self.map.name!r} produced no matchable segments")
+        return result
+
+    def _query_free(
+        self, x: float, y: float, yaw: float, lookahead: float, allowed: set[int] | None
+    ) -> LaneQuery | None:
+        """Nearest-lane projection over ``allowed`` segments, or all of them when None.
+
+        Args:
+            x: world x in metres.
+            y: world y in metres.
+            yaw: robot heading in radians.
+            lookahead: curvature lookahead in metres.
+            allowed: segment indices to consider, or None for every segment.
+
+        Returns:
+            The query, or None when ``allowed`` excludes every segment.
+        """
         p = np.array([x, y], dtype=np.float64)
         best_dist = math.inf
         best_index = -1
         best_s = 0.0
-        if self._line_idx.size:
-            rel = p[None, :] - self._line_p0
-            proj = np.clip((rel * self._line_t).sum(axis=1), 0.0, self._line_len)
-            near = self._line_p0 + self._line_t * proj[:, None]
+        line_keep = (
+            slice(None) if allowed is None else np.isin(self._line_idx, np.fromiter(allowed, dtype=np.int64))
+        )
+        line_idx = self._line_idx[line_keep]
+        if line_idx.size:
+            rel = p[None, :] - self._line_p0[line_keep]
+            t0 = self._line_t[line_keep]
+            proj = np.clip((rel * t0).sum(axis=1), 0.0, self._line_len[line_keep])
+            near = self._line_p0[line_keep] + t0 * proj[:, None]
             dist = np.linalg.norm(p[None, :] - near, axis=1)
             k = int(np.argmin(dist))
             if dist[k] < best_dist:
-                best_dist, best_index, best_s = float(dist[k]), int(self._line_idx[k]), float(proj[k])
-        if self._arc_idx.size:
-            rel = p[None, :] - self._arc_c
+                best_dist, best_index, best_s = float(dist[k]), int(line_idx[k]), float(proj[k])
+        arc_keep = (
+            slice(None) if allowed is None else np.isin(self._arc_idx, np.fromiter(allowed, dtype=np.int64))
+        )
+        arc_idx = self._arc_idx[arc_keep]
+        if arc_idx.size:
+            rel = p[None, :] - self._arc_c[arc_keep]
             ang = np.arctan2(rel[:, 1], rel[:, 0])
-            sign = np.sign(self._arc_dt)
-            delta = np.mod((ang - self._arc_t0) * sign, 2.0 * math.pi)
-            span = np.abs(self._arc_dt)
+            arc_dt = self._arc_dt[arc_keep]
+            sign = np.sign(arc_dt)
+            delta = np.mod((ang - self._arc_t0[arc_keep]) * sign, 2.0 * math.pi)
+            span = np.abs(arc_dt)
             # Points beyond the arc end snap to whichever endpoint is angularly closer.
             beyond = delta > span
             delta = np.where(beyond & (delta - span > (2.0 * math.pi - delta)), 0.0, delta)
             delta = np.clip(delta, 0.0, span)
-            theta = self._arc_t0 + sign * delta
-            near = self._arc_c + self._arc_r[:, None] * np.stack([np.cos(theta), np.sin(theta)], axis=1)
+            theta = self._arc_t0[arc_keep] + sign * delta
+            arc_r = self._arc_r[arc_keep]
+            near = self._arc_c[arc_keep] + arc_r[:, None] * np.stack([np.cos(theta), np.sin(theta)], axis=1)
             dist = np.linalg.norm(p[None, :] - near, axis=1)
             k = int(np.argmin(dist))
             if dist[k] < best_dist:
                 best_dist = float(dist[k])
-                best_index = int(self._arc_idx[k])
-                best_s = float(delta[k] * self._arc_r[k])
+                best_index = int(arc_idx[k])
+                best_s = float(delta[k] * arc_r[k])
+        if best_index < 0:
+            return None
         seg = self.segments[best_index]
         point = seg.point_at(best_s)
         tangent = seg.tangent_at(best_s)

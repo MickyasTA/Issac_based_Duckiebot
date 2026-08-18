@@ -635,7 +635,8 @@ class MjDuckiebotEnv:
         self._start_xy = np.array([x, y])
         self._prev_wheel_pos = self._wheel_positions()
         self._encoder_speed[:] = 0.0
-        query = self.lane.query(x, y, yaw)
+        query = self.lane.query(x, y, yaw)  # free global match: this is the spawn
+        self._prev_match = (query.segment, query.s)
         self._loop_length = self.lane.cycle_length(query.segment)
         self._prev_gap = self._nearest_obstacle_gap(x, y)
         if self._stack is not None:
@@ -727,7 +728,8 @@ class MjDuckiebotEnv:
         self._step_count += 1
         self._update_encoders()
         x, y, yaw = self.pose()
-        query = self.lane.query(x, y, yaw)
+        query = self.lane.query(x, y, yaw, prev_match=getattr(self, "_prev_match", None))
+        self._prev_match = (query.segment, query.s)
 
         after = np.array([x, y])
         ds = float((after - before) @ np.asarray(query.tangent))
@@ -973,7 +975,7 @@ class MjDuckiebotEnv:
             distance to the nearest obstacle, closing speed, and the along-lane speed.
         """
         x, y, yaw = self.pose()
-        query = self.lane.query(x, y, yaw)
+        query = self.lane.query(x, y, yaw, prev_match=getattr(self, "_prev_match", None))
         distance, closing = self._nearest_obstacle_state(x, y, yaw)
         extra = np.array(
             [
