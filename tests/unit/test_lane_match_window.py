@@ -38,18 +38,18 @@ def zigzag() -> LaneGraph:
     return LaneGraph(M.builtin_map("zigzag"))
 
 
-def _one(graph: LaneGraph, x: float, y: float, yaw: float, prev: float | None) -> Any:
-    """Query one pose, optionally with a previous route position."""
-    prev_t = None if prev is None else torch.tensor([prev])
-    return graph.query([x], [y], [yaw], prev_route_pos=prev_t)
+def _one(graph: LaneGraph, x: float, y: float, yaw: float, prev: tuple[int, float] | None) -> Any:
+    """Query one pose, optionally continuing from a previous ``(segment, s)`` match."""
+    if prev is None:
+        return graph.query([x], [y], [yaw])
+    return graph.query([x], [y], [yaw], prev_seg_id=torch.tensor([prev[0]]), prev_s=torch.tensor([prev[1]]))
 
 
-def _flank_ids(graph: LaneGraph) -> tuple[int, int, float]:
-    """Return (segment A id, segment B id, A's route position at the flank row)."""
+def _flank_ids(graph: LaneGraph) -> tuple[int, int, tuple[int, float]]:
+    """Return (segment A id, segment B id, A's ``(segment, s)`` match at the flank row)."""
     qa = _one(graph, A_X, FLANK_Y, YAW_SOUTH, None)
     qb = _one(graph, B_X, FLANK_Y, math.pi / 2.0, None)
-    route_a = float(graph.route_offsets[int(qa.seg_id)] + float(qa.s))
-    return int(qa.seg_id), int(qb.seg_id), route_a
+    return int(qa.seg_id), int(qb.seg_id), (int(qa.seg_id), float(qa.s))
 
 
 def test_fixture_flanks_are_where_the_docstring_says(zigzag: LaneGraph) -> None:
@@ -97,7 +97,7 @@ def test_windowed_match_follows_legitimate_driving(zigzag: LaneGraph) -> None:
     """Driving properly along the lane, the window never interferes and d stays near zero."""
     a_id, _, _ = _flank_ids(zigzag)
     seg = zigzag.segments[a_id]
-    prev_route = None
+    prev_route: tuple[int, float] | None = None
     step_m = 0.03
     n_steps = int(seg.length / step_m) + 12  # runs through the end of A into its successors
     x, y = seg.p0
@@ -105,18 +105,18 @@ def test_windowed_match_follows_legitimate_driving(zigzag: LaneGraph) -> None:
         x += seg.t0[0] * 0.0  # kept for symmetry; motion is written explicitly below
         query = _one(zigzag, x, y, YAW_SOUTH, prev_route)
         assert abs(float(query.d)) < 5e-3
-        prev_route = float(zigzag.route_offsets[int(query.seg_id)] + float(query.s))
+        prev_route = (int(query.seg_id), float(query.s))
         y -= step_m  # lane A runs south
         if y < seg.p1[1]:
             break
 
 
-def test_nan_previous_route_position_is_a_free_search(zigzag: LaneGraph) -> None:
-    """NaN entries (fresh resets) behave exactly like the unconstrained search."""
+def test_untracked_sentinel_is_a_free_search(zigzag: LaneGraph) -> None:
+    """A -1 previous segment (fresh reset) behaves exactly like the unconstrained search."""
     free = _one(zigzag, B_X - 0.02, FLANK_Y, YAW_SOUTH, None)
-    nan = _one(zigzag, B_X - 0.02, FLANK_Y, YAW_SOUTH, float("nan"))
-    assert int(free.seg_id) == int(nan.seg_id)
-    assert float(free.d) == pytest.approx(float(nan.d))
+    untracked = _one(zigzag, B_X - 0.02, FLANK_Y, YAW_SOUTH, (-1, 0.0))
+    assert int(free.seg_id) == int(untracked.seg_id)
+    assert float(free.d) == pytest.approx(float(untracked.d))
 
 
 def test_window_is_inert_on_intersection_maps(zigzag: LaneGraph) -> None:
@@ -125,21 +125,38 @@ def test_window_is_inert_on_intersection_maps(zigzag: LaneGraph) -> None:
     assert not graph.has_route
     x, y = graph.segments[0].p0
     free = graph.query([x + 0.05], [y], [0.0])
-    windowed = graph.query([x + 0.05], [y], [0.0], prev_route_pos=torch.tensor([0.0]))
+    windowed = graph.query([x + 0.05], [y], [0.0], prev_seg_id=torch.tensor([0]), prev_s=torch.tensor([0.0]))
     assert int(free.seg_id) == int(windowed.seg_id)
     assert float(free.d) == pytest.approx(float(windowed.d))
 
 
-def test_stuck_window_falls_back_to_the_free_search(zigzag: LaneGraph) -> None:
-    """A window that excludes every segment must degrade to the free search, not to garbage.
+def test_an_adversarial_window_never_returns_a_garbage_match(zigzag: LaneGraph) -> None:
+    """However hostile the previous match and the window, the answer stays self-consistent.
 
-    Forced with a tiny window and a route position no segment interval intersects exactly;
-    with the normal window this cannot happen on a real map, which is the point of the guard.
+    An all-infinite cost row would make ``argmin`` return segment 0 and a ``d`` belonging to
+    somewhere else entirely, which is why the query keeps a fallback to the free search. On the
+    built-in maps that branch turns out to be unreachable, because the projection clamps at
+    segment ends: the predecessor's end point and the successor's start point are the same route
+    position, so the previous match is always representable and the window is never empty. The
+    branch stays as a guard for pathological geometry, and what is asserted here is the property
+    it protects rather than the line itself: whatever segment comes back, ``d`` is finite and is
+    genuinely that segment's signed offset.
     """
-    free = _one(zigzag, A_X, FLANK_Y, YAW_SOUTH, None)
-    tiny = zigzag.query([A_X], [FLANK_Y], [YAW_SOUTH], prev_route_pos=torch.tensor([1e6]), window_m=1e-12)
-    assert int(tiny.seg_id) == int(free.seg_id)
-    assert float(tiny.d) == pytest.approx(float(free.d))
+    for offset in range(0, len(zigzag.segments), 7):
+        for window in (1e-12, 0.01, MATCH_WINDOW_M):
+            query = zigzag.query(
+                [A_X],
+                [FLANK_Y],
+                [YAW_SOUTH],
+                prev_seg_id=torch.tensor([offset]),
+                prev_s=torch.tensor([0.0]),
+                window_m=window,
+            )
+            seg_id, d = int(query.seg_id), float(query.d)
+            assert 0 <= seg_id < len(zigzag.segments)
+            assert math.isfinite(d)
+            reach = math.hypot(A_X - float(query.closest_x), FLANK_Y - float(query.closest_y))
+            assert abs(d) <= reach + 1e-6, "d must belong to the segment that was returned"
 
 
 # ------------------------------------------------------------------- MuJoCo twin parity
@@ -245,3 +262,69 @@ def test_cutting_no_longer_earns_progress_credit(zigzag: LaneGraph) -> None:
     assert paid_windowed == 0.0, "the windowed accounting refuses the cut any progress"
     assert float(wrong_lane_indicator(free.psi)) == 0.0, "the old accounting saw nothing wrong"
     assert float(wrong_lane_indicator(windowed.psi)) == 1.0, "the window keeps the flag firing"
+
+
+# ------------------------------------------------------- the regression that reached a run
+@pytest.mark.parametrize("map_name", ["zigzag", "loop_small", "loop_big"])
+def test_a_full_lap_keeps_the_match_on_the_robot(map_name: str) -> None:
+    """Driving a whole lap down the lane centre, the match tracks and ``d`` stays at zero.
+
+    The guard against the failure the first version of this window shipped with. A map is a
+    union of directed cycles with independent zeros and lengths (``zigzag``: 10.93 m and
+    9.46 m); comparing route offsets across cycles, and reducing them modulo the longest one,
+    made the arithmetic wrong by 1.47 m against a 0.35 m window on the shorter cycle. Legitimate
+    successors were then excluded, the match pinned to a stale segment, and ``d`` grew without
+    bound as the robot drove away from it. In a live run that showed up as mean episode
+    ``lane_dev_rms`` jumping from 0.06 m to 0.61 m with almost no off-drivable terminations,
+    which is the signature of a measurement failure rather than a driving failure: a robot
+    really 1.5 m off its lane would have left the road.
+
+    Walking the lane centreline is the strongest available oracle, because ``d`` is zero there
+    by construction for the correct match and large for any other.
+    """
+    graph = LaneGraph(M.builtin_map(map_name))
+    start = next(i for i, seg in enumerate(graph.segments) if not seg.is_arc)
+    cycle = graph.segment_cycle[start]
+    lap = graph.segment_cycle_length[start]
+
+    index, arc, travelled = start, 0.0, 0.0
+    prev: tuple[int, float] | None = None
+    step_m = 0.02  # half the 0.041 m a full-speed control step covers
+    worst = 0.0
+    while travelled < lap:
+        seg = graph.segments[index]
+        if arc > seg.length:
+            arc -= seg.length
+            index = graph.successors[index][0]
+            continue
+        point = _point_on(seg, arc)
+        tangent = _tangent_on(seg, arc)
+        yaw = math.atan2(tangent[1], tangent[0])
+        query = _one(graph, point[0], point[1], yaw, prev)
+        worst = max(worst, abs(float(query.d)))
+        assert graph.segment_cycle[int(query.seg_id)] == cycle, (
+            f"{map_name}: match left the robot's cycle after {travelled:.2f} m"
+        )
+        prev = (int(query.seg_id), float(query.s))
+        arc += step_m
+        travelled += step_m
+    assert worst < 1e-3, f"{map_name}: |d| reached {worst:.4f} m while driving the lane centre"
+
+
+def _point_on(seg, arc: float) -> tuple[float, float]:
+    """World point at arc length ``arc`` along ``seg``."""
+    if not seg.is_arc:
+        return (seg.p0[0] + seg.t0[0] * arc, seg.p0[1] + seg.t0[1] * arc)
+    theta = seg.theta0 + seg.sweep_sign * (arc / seg.radius)
+    return (
+        seg.center[0] + seg.radius * math.cos(theta),
+        seg.center[1] + seg.radius * math.sin(theta),
+    )
+
+
+def _tangent_on(seg, arc: float) -> tuple[float, float]:
+    """Unit tangent at arc length ``arc`` along ``seg``."""
+    if not seg.is_arc:
+        return seg.t0
+    theta = seg.theta0 + seg.sweep_sign * (arc / seg.radius)
+    return (-seg.sweep_sign * math.sin(theta), seg.sweep_sign * math.cos(theta))

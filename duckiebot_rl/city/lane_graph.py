@@ -419,24 +419,38 @@ class LaneGraph:
     def _build_route(self) -> tuple[list[float], bool]:
         """Cumulative arc length along each directed lane cycle, when the map is a pure loop.
 
+        A map is a UNION of directed cycles, not one cycle: a plain loop map carries one cycle
+        per travel direction, and on ``zigzag`` those are 10.93 m and 9.46 m long. Offsets
+        therefore restart at zero in each cycle and are only comparable within one, which is why
+        this also records :attr:`segment_cycle` and :attr:`segment_cycle_length`. Comparing two
+        offsets without checking they share a cycle, or reducing them modulo the wrong cycle's
+        length, silently mixes up two different places on the map.
+
         Returns:
             ``(route_offsets, has_route)``. When every segment has exactly one successor the map
             is a union of directed cycles and the offsets are cumulative arc lengths within each
             cycle; otherwise the offsets are all zero and ``has_route`` is ``False``.
         """
         offsets = [0.0] * len(self.segments)
+        self.segment_cycle = [-1] * len(self.segments)
+        self.segment_cycle_length = [0.0] * len(self.segments)
         if any(len(s) != 1 for s in self.successors):
             return offsets, False
         seen: set[int] = set()
         for start in range(len(self.segments)):
             if start in seen:
                 continue
-            cur, total = start, 0.0
+            cycle_id = len(set(self.segment_cycle) - {-1})
+            cur, total, members = start, 0.0, []
             while cur not in seen:
                 seen.add(cur)
+                members.append(cur)
                 offsets[cur] = total
                 total += self.segments[cur].length
+                self.segment_cycle[cur] = cycle_id
                 cur = self.successors[cur][0]
+            for member in members:
+                self.segment_cycle_length[member] = total
         return offsets, True
 
     @property
@@ -456,7 +470,8 @@ class LaneGraph:
         heading_weight: float = DEFAULT_HEADING_WEIGHT,
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
-        prev_route_pos: torch.Tensor | None = None,
+        prev_seg_id: torch.Tensor | None = None,
+        prev_s: torch.Tensor | None = None,
         window_m: float = MATCH_WINDOW_M,
     ) -> LaneQuery:
         """Query this single map. See :meth:`BatchedLaneGraph.query`.
@@ -468,8 +483,9 @@ class LaneGraph:
             heading_weight: Tie-break weight in metres squared.
             device: Torch device; defaults to CPU.
             dtype: Floating dtype.
-            prev_route_pos: Previous route positions for continuity-constrained matching, or
-                None/NaN entries for a free search; see :meth:`BatchedLaneGraph.query`.
+            prev_seg_id: Previously matched segments for continuity-constrained matching,
+                ``-1`` for a free search; see :meth:`BatchedLaneGraph.query`.
+            prev_s: Arc length along ``prev_seg_id``.
             window_m: Route half-width of the window in metres.
 
         Returns:
@@ -490,7 +506,8 @@ class LaneGraph:
             y,
             yaw,
             heading_weight=heading_weight,
-            prev_route_pos=prev_route_pos,
+            prev_seg_id=prev_seg_id,
+            prev_s=prev_s,
             window_m=window_m,
         )
 
@@ -601,18 +618,18 @@ class BatchedLaneGraph:
             device=self.device,
         )
         self.variant_has_route = torch.tensor([g.has_route for g in self.graphs], device=self.device)
+        cycle_id = torch.full((v, s), -1, dtype=torch.long)
+        cycle_len = torch.ones((v, s), dtype=dtype)
+        for vi, graph in enumerate(self.graphs):
+            for si in range(len(graph.segments)):
+                cycle_id[vi, si] = graph.segment_cycle[si]
+                cycle_len[vi, si] = max(graph.segment_cycle_length[si], 1e-6)
+        self.seg_cycle = cycle_id.to(self.device)
+        self.seg_cycle_length = cycle_len.to(self.device)
 
         # loop circumference per variant; 1.0 (not 0) where there is no route so that the
         # windowed-matching remainder below never divides by zero on intersection maps, where
         # the window is masked off anyway
-        def _loop_length(g: LaneGraph) -> float:
-            if not g.has_route:
-                return 1.0
-            return max(g.route_offsets[si] + seg.length for si, seg in enumerate(g.segments))
-
-        self.route_length = torch.tensor(
-            [_loop_length(g) for g in self.graphs], dtype=dtype, device=self.device
-        )
 
     # ------------------------------------------------------------------------------- helpers
     def _as_batch(self, value: Any) -> torch.Tensor:
@@ -627,7 +644,8 @@ class BatchedLaneGraph:
         y: Any,
         yaw: Any,
         heading_weight: float = DEFAULT_HEADING_WEIGHT,
-        prev_route_pos: torch.Tensor | None = None,
+        prev_seg_id: torch.Tensor | None = None,
+        prev_s: torch.Tensor | None = None,
         window_m: float = MATCH_WINDOW_M,
     ) -> LaneQuery:
         """Match a batch of poses to lanes and return the reward ground truth.
@@ -638,16 +656,26 @@ class BatchedLaneGraph:
             y: ``(B,)`` world y in metres.
             yaw: ``(B,)`` heading in radians, counter-clockwise from ``+x``.
             heading_weight: Tie-break weight in metres squared; see the module docstring.
-            prev_route_pos: ``(B,)`` route position (:meth:`route_progress`) each environment was
-                matched to on the PREVIOUS step, or ``None``/NaN entries for a free global match.
-                When given, matching is constrained to segments within ``window_m`` of it along
-                the directed route. This is what makes ``d`` truthful when the robot leaves its
-                lane: without it, the nearest-segment search re-homes a robot that crosses the
-                centreline onto the adjacent lane of the route, so ``|d|`` collapses exactly when
+            prev_seg_id: ``(B,)`` segment each environment was matched to on the PREVIOUS step,
+                with ``-1`` meaning "not tracked yet", which asks for a free global match. When
+                given, matching is constrained to segments reachable within ``window_m`` of route
+                arc length IN THE SAME CYCLE. This is what makes ``d`` truthful when the robot
+                leaves its lane: without it, the nearest-segment search re-homes a robot that
+                crosses the centreline onto the adjacent lane, so ``|d|`` collapses exactly when
                 it should be growing, every reward term derived from it goes blind, and cutting a
                 hairpin is reported as flawless driving a few segments further along. Measured on
                 ``city_000`` before the window existed: crossing the centreline flipped
                 ``seg_id`` 2 to 3 and collapsed ``|d|`` 0.103 m to 0.003 m.
+
+                The cycle check is not a detail. A map is a union of directed cycles, one per
+                travel direction, each with its own zero and its own length (``zigzag``: 10.93 m
+                and 9.46 m). An earlier version of this window compared offsets across cycles and
+                reduced them modulo the longest one; on the shorter cycle the arithmetic was off
+                by 1.47 m against a 0.35 m window, so legitimate successors were excluded, the
+                match pinned to a stale segment, and ``d`` grew without bound as the robot drove
+                away from it. That regression reached a live training run and is what
+                ``test_a_full_lap_keeps_the_match_on_the_robot`` now guards.
+            prev_s: ``(B,)`` arc length along ``prev_seg_id``; zeros when omitted.
             window_m: Half-width of the allowed route interval in metres. The default clears one
                 tile comfortably while keeping the return lane of a hairpin, one lane separation
                 away in space but several tiles away along the route, out of reach.
@@ -725,20 +753,25 @@ class BatchedLaneGraph:
         psi_all = wrap_to_pi(yaw_t[:, None] - torch.atan2(tan_y, tan_x))
         cost = dist2 + heading_weight * (1.0 - torch.cos(psi_all))
         cost = torch.where(valid, cost, torch.full_like(cost, float("inf")))
-        if prev_route_pos is not None:
-            prev = self._as_batch(prev_route_pos)
-            length = self.route_length[vidx].unsqueeze(1)
+        if prev_seg_id is not None:
+            prev_seg = torch.as_tensor(prev_seg_id, dtype=torch.long, device=self.device).reshape(-1)
+            prev_arc = torch.zeros_like(px) if prev_s is None else self._as_batch(prev_s)
+            tracked = prev_seg >= 0
+            safe_seg = torch.where(tracked, prev_seg, torch.zeros_like(prev_seg))
+            prev_route = self.seg_route_s[vidx, safe_seg] + prev_arc
+            prev_cycle = self.seg_cycle[vidx, safe_seg]
+            # every offset is relative to its OWN cycle, so the modulus is the previous
+            # segment's cycle length and a candidate in a different cycle is never comparable
+            length = self.seg_cycle_length[vidx, safe_seg].unsqueeze(1)
             candidate = self.seg_route_s[vidx] + s_all
-            ahead = torch.remainder(candidate - prev[:, None], length)
+            ahead = torch.remainder(candidate - prev_route[:, None], length)
             circular = torch.minimum(ahead, length - ahead)
-            constrain = (
-                torch.isfinite(prev)[:, None]
-                & self.variant_has_route[vidx].unsqueeze(1)
-                & (circular > window_m)
-            )
+            same_cycle = self.seg_cycle[vidx] == prev_cycle[:, None]
+            reachable = same_cycle & (circular <= window_m)
+            constrain = tracked[:, None] & self.variant_has_route[vidx].unsqueeze(1) & ~reachable
             windowed = torch.where(constrain, torch.full_like(cost, float("inf")), cost)
-            # a window that excludes every segment (teleport, giant integration step) must fall
-            # back to the free match rather than return garbage from an all-inf argmin
+            # a window that excludes every segment (teleport, a push, a giant integration step)
+            # must fall back to the free match rather than return garbage from an all-inf argmin
             stuck = torch.isinf(windowed).all(dim=1, keepdim=True)
             cost = torch.where(stuck, cost, windowed)
         best = torch.argmin(cost, dim=1)

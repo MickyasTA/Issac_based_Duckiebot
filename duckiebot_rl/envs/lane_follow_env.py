@@ -274,10 +274,11 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         self._ds = torch.zeros(n, device=device)
         self._seg_id = torch.zeros(n, dtype=torch.long, device=device)
         self._arc_s = torch.zeros(n, device=device)
-        # route position of the previous step's lane match, NaN until the first post-reset
-        # query. Feeding it back constrains matching to route-continuous segments, which is
-        # what keeps d truthful when the robot leaves its lane; see BatchedLaneGraph.query.
-        self._route_pos = torch.full((n,), float("nan"), device=device)
+        # the previous step's lane match, -1 until the first post-reset query. Feeding it back
+        # constrains matching to route-continuous segments of the SAME cycle, which is what
+        # keeps d truthful when the robot leaves its lane; see BatchedLaneGraph.query.
+        self._prev_seg_id = torch.full((n,), -1, dtype=torch.long, device=device)
+        self._prev_arc_s = torch.zeros(n, device=device)
         self._body_speed = torch.zeros(n, device=device)
         self._reward_terms: dict[str, torch.Tensor] = {}
         self._flags: TerminationFlags | None = None
@@ -609,13 +610,15 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
             self._root_xy[:, 0],
             self._root_xy[:, 1],
             self._yaw,
-            prev_route_pos=self._route_pos,
+            prev_seg_id=self._prev_seg_id,
+            prev_s=self._prev_arc_s,
         )
         self._d = query.d
         self._psi = query.psi
         self._seg_id = query.seg_id
         self._arc_s = query.s
-        self._route_pos = self._lane.route_progress(self._variant_idx, query.seg_id, query.s)
+        self._prev_seg_id = query.seg_id
+        self._prev_arc_s = query.s
         self._ds = progress_delta(
             self._prev_xy[:, 0],
             self._prev_xy[:, 1],
@@ -957,7 +960,8 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         self._gap[ids] = float("inf")
         self._prev_gap[ids] = float("inf")
         self._ep_distance[ids] = 0.0
-        self._route_pos[ids] = float("nan")  # first post-reset match is a free global search
+        self._prev_seg_id[ids] = -1  # first post-reset match is a free global search
+        self._prev_arc_s[ids] = 0.0
         self._ep_abs_d_integral[ids] = 0.0
         self._ep_out_of_lane_integral[ids] = 0.0
         self._ep_wrong_lane_s[ids] = 0.0
