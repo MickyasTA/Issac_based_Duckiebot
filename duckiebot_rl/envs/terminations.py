@@ -107,10 +107,23 @@ class TerminationFlags:
     def counts(self) -> dict[str, int]:
         """Return the number of envs each condition fired for, for logging.
 
+        One host sync, not seven. The obvious ``{name: int(mask.sum().item())}`` costs a separate
+        device-to-host round trip per field, and the M-phase sync census found this the single
+        largest source of them in the whole rollout: 7 of the 23.4 synchronizing calls per
+        control step, because ``_get_dones`` called this on EVERY step. Stacking first collapses
+        the seven trips into one, and :attr:`DuckiebotLaneFollowEnv._termination_counts` then
+        defers even that one to the steps whose counts something actually reads.
+
+        The values are unchanged: summing a bool mask over the env axis is the same integer
+        whether the masks are summed one at a time or as one stacked tensor.
+
         Returns:
-            ``{condition_name: count}`` over the five conditions plus the two flags.
+            ``{condition_name: count}`` over the five conditions plus the two flags, in field
+            order.
         """
-        return {name: int(mask.sum().item()) for name, mask in self.__dict__.items()}
+        names = list(self.__dict__)
+        totals = torch.stack([self.__dict__[name] for name in names]).sum(dim=-1)
+        return dict(zip(names, (int(v) for v in totals.tolist()), strict=True))
 
 
 # =============================================================================================

@@ -34,17 +34,60 @@ of the update (SPEC v2 S6.7 guard 5). The two deliberate exceptions are the epoc
 from __future__ import annotations
 
 import math
-from collections import defaultdict
 
 import torch
 import torch.nn as nn
 
 from duckiebot_rl.ppo.buffer import RolloutBuffer
-from duckiebot_rl.ppo.config import PPOConfig, ratio_assert_atol
+from duckiebot_rl.ppo.config import PPOConfig, ratio_assert_atol, strict_fp32_enabled
 from duckiebot_rl.ppo.distributions import approx_kl_k3, diag_gaussian_kl
 from duckiebot_rl.ppo.gae import compute_gae
 from duckiebot_rl.ppo.networks import ActorCritic
 from duckiebot_rl.ppo.running_norm import RunningMeanStd
+
+#: The diagnostics :meth:`PPO.update` accumulates per gradient step, in sorted order. A module
+#: constant rather than an implicit ``sorted(stats)`` so the order the closing ``zip`` depends on
+#: is stated once and testable, and so a reader can see at a glance exactly what the single
+#: end-of-update host synchronisation carries (SPEC v2 S6.7 guard 5).
+UPDATE_STAT_KEYS: tuple[str, ...] = (
+    "analytic_kl",
+    "approx_kl",
+    "bounds_loss",
+    "clipfrac",
+    "entropy",
+    "grad_norm",
+    "mean_abs_mu",
+    "mean_sigma",
+    "policy_loss",
+    "ratio_mean",
+    "value_loss",
+)
+
+
+def accelerator_flags(cfg: PPOConfig, device: torch.device) -> tuple[bool, bool]:
+    """Resolve the two kernel-level accelerations against the device and the precision policy.
+
+    Both are requested by :class:`~duckiebot_rl.ppo.config.PPOConfig` and both are gated here
+    rather than at the call site, so there is exactly one place that decides whether a run is on
+    the accelerated path.
+
+    * Neither applies on CPU. ``channels_last`` convolution on CPU is a different (and for these
+      shapes slower) code path, and there is no fused CUDA Adam kernel to use.
+    * Neither applies in strict fp32 mode. That mode exists to provide a bit-reproducible
+      reference, and both accelerations were measured to shift the parameters slightly - by up to
+      4.4e-5 and 1.1e-5 absolute over eight optimiser steps - through kernel selection and float
+      reassociation respectively.
+
+    Args:
+        cfg: The learner configuration carrying the requests.
+        device: The device the learner runs on.
+
+    Returns:
+        ``(channels_last, fused_optimizer)`` as actually applied.
+    """
+    if device.type != "cuda" or strict_fp32_enabled():
+        return False, False
+    return bool(cfg.channels_last), bool(cfg.fused_optimizer)
 
 
 class RatioAssertionError(AssertionError):
@@ -74,14 +117,29 @@ class PPO:
         priv_norm: Running normaliser for the privileged vector observation.
         value_norm: Running normaliser for the value targets.
         num_updates: Number of completed calls to :meth:`update`.
+        channels_last: Whether the convolution weights were actually put in channels-last layout.
+        fused_optimizer: Whether the fused CUDA Adam kernel is actually in use.
     """
 
     def __init__(self, agent: ActorCritic, cfg: PPOConfig, device: torch.device | str | None = None) -> None:
         self.cfg = cfg
         self.device = torch.device(device if device is not None else cfg.device)
         self.agent = agent.to(self.device)
+        self.channels_last, self.fused_optimizer = accelerator_flags(cfg, self.device)
+        if self.channels_last:
+            # The observation is NHWC and prepare() only permutes it, so every convolution already
+            # receives a channels-last-strided input and cuDNN already picks channels-last
+            # kernels; storing the weights that way removes the per-call weight copy it would
+            # otherwise make on all 30 convolutions.
+            self.agent = self.agent.to(memory_format=torch.channels_last)
+        self.agent.set_encoder_checkpointing(cfg.checkpoint_encoder)
         self.learning_rate = cfg.learning_rate
-        self.optimizer = torch.optim.Adam(self.agent.parameters(), lr=cfg.learning_rate, eps=cfg.adam_eps)
+        self.optimizer = torch.optim.Adam(
+            self.agent.parameters(),
+            lr=cfg.learning_rate,
+            eps=cfg.adam_eps,
+            fused=self.fused_optimizer,
+        )
         net = cfg.network
         self.vec_norm = RunningMeanStd((net.vec_dim,), device=self.device)
         self.priv_norm = RunningMeanStd((net.priv_dim,), device=self.device)
@@ -89,6 +147,22 @@ class PPO:
         self.num_updates = 0
 
     # ---------------------------------------------------------------- helpers
+
+    def _set_agent_mode(self, training: bool) -> None:
+        """Put the agent in train or eval mode, skipping the walk when it is already there.
+
+        ``nn.Module.train`` recurses over all ~90 submodules on every call, and :meth:`act` used
+        to call ``eval()`` once per control step. Nothing in this project ever puts a SUBMODULE in
+        a different mode from its parent, so the root flag is a faithful summary of the tree and
+        this early-out is exact. There is no dropout or normalisation layer in the architecture,
+        so the mode does not affect any number either way; it is kept correct because the export
+        path and any future layer would depend on it.
+
+        Args:
+            training: True for train mode, False for eval mode.
+        """
+        if self.agent.training is not training:
+            self.agent.train(training)
 
     def set_learning_rate(self, learning_rate: float) -> None:
         """Set the optimiser learning rate, clamped to the configured bounds.
@@ -161,7 +235,7 @@ class PPO:
             (what the environment should execute), ``log_prob``, ``value`` (real scale), ``mu``
             and ``log_std``.
         """
-        self.agent.eval()
+        self._set_agent_mode(False)
         priv = vec if vec_priv is None else vec_priv
         out = self.agent.get_action_and_value(
             image,
@@ -191,7 +265,7 @@ class PPO:
         Returns:
             ``(B,)`` values in reward scale.
         """
-        self.agent.eval()
+        self._set_agent_mode(False)
         raw = self.agent.get_value(image, self.normalize_priv(vec_priv))
         return self._real_value(raw)
 
@@ -212,9 +286,30 @@ class PPO:
 
         Returns:
             Number of captured terminal observations that were evaluated.
+
+        Raises:
+            ValueError: If the buffer captured terminal images but no ``last_image`` was supplied.
         """
-        num_terminals = buffer.compute_terminal_values(self.predict_values)
-        last_values = self.predict_values(last_image, last_vec_priv)
+        # ONE critic pass, not two. The captured terminals and the last-step bootstrap need the
+        # same network in the same mode, and the critic is a pure per-row function, so evaluating
+        # them as a single batch returns exactly the rows the two separate passes returned while
+        # paying the dispatch once. The profile measured the split as 517 ms + 178 ms per
+        # iteration.
+        step_index, env_index, term_priv, term_image = buffer.terminal_inputs()
+        num_terminals = int(step_index.numel())  # tensor metadata: no host synchronisation
+        if term_image is None:
+            batched_image = None
+        else:
+            if last_image is None:
+                raise ValueError(
+                    "the buffer captured terminal images, so last_image is required for the "
+                    "bootstrap pass; passing None would evaluate the critic on a different "
+                    "observation space than the rollout used"
+                )
+            batched_image = torch.cat([term_image, last_image])
+        batched_values = self.predict_values(batched_image, torch.cat([term_priv, last_vec_priv]))
+        buffer.scatter_terminal_values(step_index, env_index, batched_values[:num_terminals])
+        last_values = batched_values[num_terminals:]
         advantages, returns = compute_gae(
             rewards=buffer.rewards,
             values=buffer.values,
@@ -275,8 +370,16 @@ class PPO:
         batch = buffer.batch_size
         minibatch_size = batch // cfg.num_minibatches
         atol = ratio_assert_atol()
-        stats: dict[str, list[torch.Tensor]] = defaultdict(list)
-        self.agent.train()
+        # One list per diagnostic, appended per gradient step and reduced once at the end. A
+        # preallocated ``(gradient_steps, 11)`` device tensor was tried here and MEASURED SLOWER:
+        # it turns a free Python append into a stack plus a strided copy on every gradient step
+        # (64 stacks + 64 copies per update) to save the 22 kernels the closing reduction costs
+        # once. The eleven reductions that produce the scalars are the real cost the campaign
+        # profile attributed to this section (321 ms per update at N=64), and no accumulator
+        # shape changes those. Kept as lists; what matters is that nothing here leaves the
+        # device until the single closing transfer below (SPEC v2 S6.7 guard 5).
+        stats: dict[str, list[torch.Tensor]] = {key: [] for key in UPDATE_STAT_KEYS}
+        self._set_agent_mode(True)
 
         for epoch in range(cfg.update_epochs):
             perm = torch.randperm(batch, device=self.device)
@@ -335,23 +438,23 @@ class PPO:
                     analytic_kl = diag_gaussian_kl(
                         flat["mu"][idx], flat["log_std"][idx], out.mu, out.log_std
                     ).mean()
-                    stats["policy_loss"].append(pg_loss.detach())
-                    stats["value_loss"].append(value_loss.detach())
-                    stats["entropy"].append(entropy.detach())
-                    stats["bounds_loss"].append(bounds_loss.detach())
-                    stats["approx_kl"].append(approx_kl_k3(log_ratio.detach()).mean())
                     stats["analytic_kl"].append(analytic_kl)
+                    stats["approx_kl"].append(approx_kl_k3(log_ratio.detach()).mean())
+                    stats["bounds_loss"].append(bounds_loss.detach())
                     stats["clipfrac"].append(((ratio.detach() - 1.0).abs() > cfg.clip_coef).float().mean())
-                    stats["ratio_mean"].append(ratio.detach().mean())
+                    stats["entropy"].append(entropy.detach())
                     stats["grad_norm"].append(grad_norm.detach())
-                    stats["mean_sigma"].append(out.log_std.detach().exp().mean())
                     stats["mean_abs_mu"].append(out.mu.detach().abs().mean())
+                    stats["mean_sigma"].append(out.log_std.detach().exp().mean())
+                    stats["policy_loss"].append(pg_loss.detach())
+                    stats["ratio_mean"].append(ratio.detach().mean())
+                    stats["value_loss"].append(value_loss.detach())
 
                 if cfg.kl_adaptive and cfg.kl_adapt_per_minibatch:
                     self._adapt_learning_rate(float(analytic_kl.item()))
 
         with torch.no_grad():
-            keys = sorted(stats)
+            keys = UPDATE_STAT_KEYS
             means = torch.stack([torch.stack(stats[key]).mean() for key in keys])
             values_real = flat["values"]
             returns_real = flat["returns"]

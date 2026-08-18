@@ -34,6 +34,7 @@ from typing import Any, NamedTuple
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint_sequential
 
 from duckiebot_rl.ppo.config import NetworkConfig
 from duckiebot_rl.ppo.distributions import DiagGaussianHead, GaussianOutput, orthogonal_init_
@@ -128,9 +129,16 @@ class ImpoolaEncoder(nn.Module):
         self.fc = layer_init(nn.Linear(current, out_dim), gain)
         self.out_dim = out_dim
         self.in_channels = in_channels
+        self.checkpoint_trunk = False
 
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
-        """Encode a batch of stacked frames.
+    def prepare(self, image: torch.Tensor) -> torch.Tensor:
+        """Convert an NHWC observation to the NCHW float tensor the convolutions consume.
+
+        Split out of :meth:`forward` so that the actor and the critic, which own separate
+        encoders but read the SAME image, pay for the permute, the widening and the ``/255``
+        exactly once per batch instead of twice (see
+        :meth:`ActorCritic.get_action_and_value`). The returned tensor is byte-for-byte the one
+        :meth:`forward` would have built, so sharing it changes no number anywhere.
 
         Args:
             image: NHWC batch, ``(B, H, W, C)``, dtype uint8 (raw observation) or float32
@@ -138,7 +146,7 @@ class ImpoolaEncoder(nn.Module):
                 happen here and nowhere else, per SPEC v2 S5.2.
 
         Returns:
-            Feature batch of shape ``(B, out_dim)``.
+            ``(B, C, H, W)`` float tensor scaled to ``[0, 1]``.
 
         Raises:
             ValueError: If the input is not 4-dimensional NHWC with the expected channel count.
@@ -149,10 +157,46 @@ class ImpoolaEncoder(nn.Module):
             raise ValueError(
                 f"expected {self.in_channels} channels last (NHWC), got shape {tuple(image.shape)}"
             )
-        x = image.permute(0, 3, 1, 2).float() / 255.0
-        features = self.relu(self.stages(x))
-        pooled = features.mean(dim=(2, 3))
+        return image.permute(0, 3, 1, 2).float() / 255.0
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the convolutional trunk on an already-prepared NCHW float batch.
+
+        When :attr:`checkpoint_trunk` is set and gradients are being recorded, the three
+        ConvSequences are wrapped in ``checkpoint_sequential`` so their activations are recomputed
+        during the backward pass instead of being kept. The trunk is deterministic - no dropout,
+        no normalisation layer, no RNG - so the recomputed activations are bit-identical to the
+        discarded ones and the gradients are unchanged; this is a pure memory-for-time trade, not
+        an approximation. Under ``torch.no_grad`` (the rollout path) the flag is ignored, because
+        there are no activations to keep.
+
+        Args:
+            x: ``(B, C, H, W)`` float tensor as produced by :meth:`prepare`.
+
+        Returns:
+            Feature batch of shape ``(B, out_dim)``.
+        """
+        if self.checkpoint_trunk and torch.is_grad_enabled():
+            trunk = checkpoint_sequential(self.stages, len(self.stages), x, use_reentrant=False)
+        else:
+            trunk = self.stages(x)
+        pooled = self.relu(trunk).mean(dim=(2, 3))
         return self.relu(self.fc(pooled))
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """Encode a batch of stacked frames.
+
+        Args:
+            image: NHWC batch, ``(B, H, W, C)``, dtype uint8 (raw observation) or float32
+                (already in ``[0, 255]``).
+
+        Returns:
+            Feature batch of shape ``(B, out_dim)``.
+
+        Raises:
+            ValueError: If the input is not 4-dimensional NHWC with the expected channel count.
+        """
+        return self.encode(self.prepare(image))
 
 
 class Tower(nn.Module):
@@ -200,23 +244,34 @@ class Tower(nn.Module):
             layer_init(nn.Linear(cfg.hidden_dim, head_dim), head_gain) if head_dim is not None else None
         )
 
-    def forward(self, image: torch.Tensor | None, vector: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        image: torch.Tensor | None,
+        vector: torch.Tensor,
+        prepared: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Run the tower.
 
         Args:
             image: NHWC image batch, or None in vec-only mode.
             vector: Normalised vector observation of shape ``(B, vector_dim)``.
+            prepared: The NCHW float batch that :meth:`ImpoolaEncoder.prepare` would have built
+                from ``image``, when the caller has already built it for the sibling tower. It is
+                the same tensor by construction, so passing it is a pure saving; ``image`` is
+                ignored when it is given.
 
         Returns:
             ``(B, head_dim)`` if the tower has a head, else ``(B, hidden_dim)``.
 
         Raises:
-            ValueError: If an image is required but not supplied.
+            ValueError: If an image is required but neither ``image`` nor ``prepared`` is given.
         """
         if self.encoder is not None:
-            if image is None:
-                raise ValueError("this tower was built with use_image=True but image is None")
-            fused = torch.cat([self.encoder(image), vector], dim=-1)
+            if prepared is None:
+                if image is None:
+                    raise ValueError("this tower was built with use_image=True but image is None")
+                prepared = self.encoder.prepare(image)
+            fused = torch.cat([self.encoder.encode(prepared), vector], dim=-1)
         else:
             fused = vector
         features = self.mlp(fused)
@@ -270,29 +325,74 @@ class ActorCritic(nn.Module):
             mean_head_gain=cfg.policy_head_gain,
         )
 
-    def actor_features(self, image: torch.Tensor | None, vec: torch.Tensor) -> torch.Tensor:
+    def set_encoder_checkpointing(self, enabled: bool) -> None:
+        """Turn activation checkpointing of both encoder trunks on or off.
+
+        Args:
+            enabled: True to recompute the trunk during the backward pass instead of storing its
+                activations. See :meth:`ImpoolaEncoder.encode` for why this is exact rather than
+                approximate, and ``PPOConfig.checkpoint_encoder`` for the measured trade.
+        """
+        for tower in (self.actor, self.critic):
+            if tower.encoder is not None:
+                tower.encoder.checkpoint_trunk = bool(enabled)
+
+    def prepare_image(self, image: torch.Tensor | None) -> torch.Tensor | None:
+        """Build the NCHW float batch both towers consume, once.
+
+        The actor and the critic own SEPARATE encoders (S6.2) but read the SAME pixels, so the
+        NHWC-to-NCHW permute, the uint8 widening and the ``/255`` were being paid twice per
+        forward pass. :meth:`ImpoolaEncoder.prepare` does not touch any parameter, so the tensor
+        the actor's encoder builds is bit-for-bit the one the critic's encoder would have built;
+        sharing it removes two kernels and one full-size float activation per pass and changes no
+        number.
+
+        Args:
+            image: NHWC image batch, or None in vec-only mode.
+
+        Returns:
+            The prepared ``(B, C, H, W)`` float batch, or None when there is no image encoder.
+        """
+        encoder = self.actor.encoder if self.actor.encoder is not None else self.critic.encoder
+        if encoder is None or image is None:
+            return None
+        return encoder.prepare(image)
+
+    def actor_features(
+        self,
+        image: torch.Tensor | None,
+        vec: torch.Tensor,
+        prepared: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Return the actor tower's hidden features, shape ``(B, hidden_dim)``.
 
         Args:
             image: NHWC image batch, or None in vec-only mode.
             vec: Normalised actor vector observation.
+            prepared: Output of :meth:`prepare_image`, when it has already been built.
 
         Returns:
             Hidden feature batch.
         """
-        return self.actor(image, vec)
+        return self.actor(image, vec, prepared=prepared)
 
-    def get_value(self, image: torch.Tensor | None, vec_priv: torch.Tensor) -> torch.Tensor:
+    def get_value(
+        self,
+        image: torch.Tensor | None,
+        vec_priv: torch.Tensor,
+        prepared: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Return the raw critic output, shape ``(B,)``.
 
         Args:
             image: NHWC image batch, or None in vec-only mode.
             vec_priv: Normalised privileged vector observation.
+            prepared: Output of :meth:`prepare_image`, when it has already been built.
 
         Returns:
             Raw (possibly normalised-space) value estimates.
         """
-        return self.critic(image, vec_priv).squeeze(-1)
+        return self.critic(image, vec_priv, prepared=prepared).squeeze(-1)
 
     def get_action(
         self,
@@ -300,6 +400,7 @@ class ActorCritic(nn.Module):
         vec: torch.Tensor,
         action: torch.Tensor | None = None,
         deterministic: bool = False,
+        prepared: torch.Tensor | None = None,
     ) -> GaussianOutput:
         """Sample or evaluate an action without touching the critic.
 
@@ -308,11 +409,13 @@ class ActorCritic(nn.Module):
             vec: Normalised actor vector observation.
             action: Stored unclipped sample to evaluate, or None to draw a new one.
             deterministic: Return the mean instead of sampling.
+            prepared: Output of :meth:`prepare_image`, when it has already been built.
 
         Returns:
             A :class:`GaussianOutput`.
         """
-        return self.policy_head(self.actor_features(image, vec), action=action, deterministic=deterministic)
+        features = self.actor_features(image, vec, prepared=prepared)
+        return self.policy_head(features, action=action, deterministic=deterministic)
 
     def get_action_and_value(
         self,
@@ -346,8 +449,10 @@ class ActorCritic(nn.Module):
                     f"({self.cfg.vec_dim})"
                 )
             vec_priv = vec
-        gaussian = self.get_action(image, vec, action=action, deterministic=deterministic)
-        value = self.get_value(image, vec_priv)
+        # One conversion, two towers. See :meth:`prepare_image`.
+        prepared = self.prepare_image(image)
+        gaussian = self.get_action(image, vec, action=action, deterministic=deterministic, prepared=prepared)
+        value = self.get_value(image, vec_priv, prepared=prepared)
         return ActorCriticOutput(
             action=gaussian.action,
             log_prob=gaussian.log_prob,

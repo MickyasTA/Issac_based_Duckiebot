@@ -119,23 +119,35 @@ def compute_gae(
             )
         term_values_f = term_values.to(dtype=values.dtype, device=values.device)
 
-    advantages = torch.zeros_like(rewards)
-    last_gae = torch.zeros(num_envs, dtype=values.dtype, device=values.device)
     done_f = torch.clamp(terminated_f + truncated_f, max=1.0)
 
-    for t in range(num_steps - 1, -1, -1):
-        next_values = last_values if t == num_steps - 1 else values[t + 1]
-        # At a truncation the stored next observation belongs to the NEXT episode, so its value is
-        # meaningless. Substitute the captured terminal value.
-        next_values = torch.where(truncated_f[t] > 0.0, term_values_f[t], next_values)
-        # Bootstrap only survives a truncation, never a true termination.
-        not_terminal = 1.0 - terminated_f[t]
-        # The lambda trace is cut by EITHER flag: the next stored step is a different episode.
-        not_done = 1.0 - done_f[t]
+    # Everything that is not the recursion itself is elementwise in (t, env), so it is computed
+    # for the whole rollout in one shot. Only ``last_gae = delta[t] + trace[t] * last_gae`` is
+    # genuinely sequential. The arithmetic is unchanged term by term and in the same association
+    # order, so the result is bit-identical to the fully sequential form (pinned by
+    # ``tests/unit/test_gae.py``); what changes is that a T-step rollout now issues about two
+    # kernel launches per step instead of about ten, and this loop was measured launch-bound
+    # (351 ms per iteration at T=32 in the campaign profile, once per iteration).
+    next_values = torch.empty_like(values)
+    next_values[:-1] = values[1:]
+    next_values[-1] = last_values
+    # At a truncation the stored next observation belongs to the NEXT episode, so its value is
+    # meaningless. Substitute the captured terminal value.
+    next_values = torch.where(truncated_f > 0.0, term_values_f, next_values)
+    # Bootstrap only survives a truncation, never a true termination.
+    not_terminal = 1.0 - terminated_f
+    # The lambda trace is cut by EITHER flag: the next stored step is a different episode.
+    not_done = 1.0 - done_f
 
-        delta = rewards[t] + gamma * next_values * not_terminal - values[t]
-        last_gae = delta + gamma * lam * not_done * last_gae
-        advantages[t] = last_gae
+    delta = rewards + gamma * next_values * not_terminal - values
+    trace = gamma * lam * not_done
+
+    last_gae = torch.zeros(num_envs, dtype=values.dtype, device=values.device)
+    reversed_rows: list[torch.Tensor] = []
+    for t in range(num_steps - 1, -1, -1):
+        last_gae = delta[t] + trace[t] * last_gae
+        reversed_rows.append(last_gae)
+    advantages = torch.stack(reversed_rows[::-1])
 
     returns = advantages + values
     return advantages, returns

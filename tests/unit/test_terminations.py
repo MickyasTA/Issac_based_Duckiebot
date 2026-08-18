@@ -320,3 +320,79 @@ def test_load_state_dict_rejects_an_incomplete_payload():
     state = tm.TerminationState(1, CONTROL_DT)
     with pytest.raises(KeyError, match="yaw_integral"):
         state.load_state_dict({"stall_steps": torch.zeros(1, dtype=torch.long)})
+
+
+# =============================================================================================
+# counts(): one host sync, not seven (profile rank 5)
+# =============================================================================================
+
+
+def _reference_counts(flags: tm.TerminationFlags) -> dict[str, int]:
+    """Return the counts the obvious per-field implementation produced.
+
+    Args:
+        flags: A ``TerminationFlags``.
+
+    Returns:
+        ``{field_name: int}`` computed one ``.item()`` at a time.
+    """
+    return {name: int(mask.sum().item()) for name, mask in flags.__dict__.items()}
+
+
+def _flags_from_seed(num_envs: int, seed: int) -> tm.TerminationFlags:
+    """Return a ``TerminationFlags`` with pseudo-random masks.
+
+    Args:
+        num_envs: Number of environments.
+        seed: Generator seed.
+
+    Returns:
+        The flags.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    masks = {
+        name: torch.rand(num_envs, generator=generator) < p
+        for name, p in (
+            ("off_drivable", 0.2),
+            ("obstacle", 0.05),
+            ("rollover", 0.1),
+            ("stall", 0.3),
+            ("spin", 0.0),
+            ("terminated", 0.4),
+            ("truncated", 0.15),
+        )
+    }
+    return tm.TerminationFlags(**masks)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+@pytest.mark.parametrize("num_envs", [1, 64, 256])
+def test_counts_matches_the_per_field_reference(num_envs, seed):
+    """Stacking before summing changes no integer, at any env count, including all-False axes."""
+    flags = _flags_from_seed(num_envs, seed)
+    assert flags.counts() == _reference_counts(flags)
+
+
+def test_counts_keeps_field_order():
+    """``scripts/train.py:termination_reason`` iterates the condition names; order is interface."""
+    flags = _flags_from_seed(8, 0)
+    assert list(flags.counts()) == [
+        "off_drivable",
+        "obstacle",
+        "rollover",
+        "stall",
+        "spin",
+        "terminated",
+        "truncated",
+    ]
+
+
+def test_counts_costs_one_host_transfer_not_seven(count_host_syncs):
+    """Profile rank 5: this was 7 of the 23.4 synchronising calls per control step.
+
+    ``tolist`` is the single transfer; nothing else inside ``counts`` may reach the host.
+    """
+    flags = _flags_from_seed(32, 5)
+    with count_host_syncs() as syncs:
+        flags.counts()
+        assert syncs() == 1

@@ -62,7 +62,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from duckiebot_rl.dr.curriculum import Range, RangeBook
+from duckiebot_rl.dr.curriculum import BlockSampler, Range, RangeBook
 
 __all__ = [
     "VisualDR",
@@ -810,6 +810,18 @@ class VisualDRCfg:
         enable_jpeg: Set False to skip V17 (it is the most expensive op; the ablation configs
             in ``configs/train/ablations`` use this).
         enable_motion_blur: Set False to skip V16.
+        fused_draws: Draw all 17 axes as one blocked ``torch.rand`` through
+            :class:`~duckiebot_rl.dr.curriculum.BlockSampler` instead of one draw per axis.
+
+            **Off by default; enabling it needs an explicit sign-off.** The M-phase profile
+            measured :meth:`VisualDR.sample` at 5.97 ms median per control step, essentially all
+            of it CUDA launch latency across roughly 85 tiny kernels, and the blocked form does
+            the identical arithmetic in about ten. What it cannot preserve is the RNG stream: a
+            CUDA Philox counter advances by a different amount for one large draw than for
+            seventeen small ones, so a seeded run stops reproducing the old run bit-for-bit even
+            though every axis keeps exactly its old distribution. See
+            :class:`duckiebot_rl.envs.env_cfg.PerfSettings.fused_visual_dr_draws`, which is what
+            the environment sets this from.
     """
 
     ranges: dict[str, Range] = field(default_factory=default_visual_ranges)
@@ -817,6 +829,7 @@ class VisualDRCfg:
     defocus_radius: int = 2
     enable_jpeg: bool = True
     enable_motion_blur: bool = True
+    fused_draws: bool = False
 
 
 class VisualDR:
@@ -846,6 +859,8 @@ class VisualDR:
         self.cfg = cfg or VisualDRCfg()
         self.device = device
         self.generator = generator
+        # Rebuilt only when alpha moves, which the ADR loop does at most once per iteration.
+        self._block: BlockSampler | None = None
 
     def sample(
         self,
@@ -866,8 +881,15 @@ class VisualDR:
             A :class:`VisualParams` with one entry per env.
         """
         b = self.cfg.ranges
-        kw = {"generator": self.generator, "device": self.device, "boundary": boundary}
-        p = {k: b[k].sample(self.num_envs, alpha, **kw) for k in b}
+        if self.cfg.fused_draws and not isinstance(alpha, torch.Tensor):
+            # A per-env alpha tensor has no fused form (the coefficients stop being scalars), so
+            # that case keeps the per-axis path. The environment always passes a float.
+            if self._block is None or not self._block.matches(list(b), float(alpha), self.device):
+                self._block = BlockSampler(b, list(b), float(alpha), device=self.device)
+            p = self._block.sample(self.num_envs, generator=self.generator, boundary=boundary)
+        else:
+            kw = {"generator": self.generator, "device": self.device, "boundary": boundary}
+            p = {k: b[k].sample(self.num_envs, alpha, **kw) for k in b}
         blur = p["blur_len_px"]
         if speed_frac is not None:
             blur = blur * speed_frac.to(blur.device, blur.dtype).clamp(0.0, 1.0)

@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from duckiebot_rl.dr.curriculum import (
+    BlockSampler,
     CurriculumCfg,
     HardExampleMiner,
     HardExampleMinerCfg,
@@ -271,3 +272,97 @@ def test_hard_example_miner_validates_input():
         m.update([0, 1], [1.0])
     with pytest.raises(ValueError, match="outside"):
         m.update([7], [1.0])
+
+
+# =============================================================================================
+# BlockSampler (profile rank 4)
+# =============================================================================================
+
+
+def _mixed_book() -> dict[str, Range]:
+    """Return a book exercising all four sampling modes at once.
+
+    Returns:
+        ``{axis_name: Range}``.
+    """
+    return {
+        "lin": Range(-1.0, 1.0, 0.0, "linear"),
+        "lin2": Range(0.7, 1.5, 1.0, "linear"),
+        "logz": Range(0.5 / 255.0, 10.0 / 255.0, 0.0, "log_from_zero"),
+        "logm": Range(0.3, 3.0, 1.0, "log"),
+        "idx": Range(0.0, 5.0, 0.0, "int"),
+        "outside": Range(30.0, 95.0, 100.0, "linear", nominal_outside=True),
+    }
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.33, 1.0])
+def test_block_sampler_matches_range_sample_given_the_same_uniforms(alpha):
+    """Every mode, bit for bit. The grouping must not change one ulp of the arithmetic."""
+    book = _mixed_book()
+    block = BlockSampler(book, list(book), alpha)
+    u = block.draw(64, generator=torch.Generator().manual_seed(31))
+    out = block.transform(u)
+    for row, name in enumerate(block.order):
+        assert torch.equal(out[name], book[name]._sample_scalar_alpha(u[row], alpha)), name
+
+
+def test_block_sampler_order_is_a_permutation_of_the_requested_keys():
+    """Rows are grouped by mode so each group is a contiguous slice; nothing may be lost."""
+    book = _mixed_book()
+    block = BlockSampler(book, list(book), 1.0)
+    assert sorted(block.order) == sorted(book)
+    assert block.num_axes == len(book)
+
+
+def test_block_sampler_preserves_int_dtype():
+    """An ``int`` axis indexes an HDRI table; a float would be a silent wrong texture."""
+    book = _mixed_book()
+    block = BlockSampler(book, list(book), 1.0)
+    out = block.sample(32, generator=torch.Generator().manual_seed(2))
+    assert out["idx"].dtype == torch.long
+    assert out["lin"].dtype == torch.float32
+    assert int(out["idx"].min()) >= 0 and int(out["idx"].max()) <= 5
+
+
+def test_block_sampler_boundary_forces_the_live_clamps():
+    """Same ADR rule as ``Range.sample``, drawn independently per axis."""
+    book = _mixed_book()
+    alpha = 0.6
+    block = BlockSampler(book, list(book), alpha)
+    out = block.sample(
+        1024, generator=torch.Generator().manual_seed(8), boundary=torch.ones(1024, dtype=torch.bool)
+    )
+    lo, hi = book["lin"].live(alpha)
+    on_edge = torch.isclose(out["lin"], torch.tensor(lo)) | torch.isclose(out["lin"], torch.tensor(hi))
+    assert bool(on_edge.all())
+    assert 0.35 < float((out["lin"] > 0.5 * (lo + hi)).float().mean()) < 0.65
+
+
+def test_block_sampler_draw_is_one_call_per_uniform_block():
+    """The whole point: 17 axes cost one ``torch.rand``, or two with a boundary mask."""
+    book = _mixed_book()
+    block = BlockSampler(book, list(book), 1.0)
+    assert block.draw(8, generator=torch.Generator().manual_seed(0)).shape == (len(book), 8)
+
+
+def test_block_sampler_matches_reports_a_stale_cache():
+    """``VisualDR`` caches one of these; the ADR loop moves alpha and must invalidate it."""
+    book = _mixed_book()
+    block = BlockSampler(book, list(book), 0.5)
+    assert block.matches(list(book), 0.5, None) is True
+    assert block.matches(list(book), 0.6, None) is False
+    assert block.matches(list(book)[:-1], 0.5, None) is False
+
+
+def test_block_sampler_rejects_an_unknown_axis():
+    """A typo in a range book must fail at construction, not produce a silently missing axis."""
+    with pytest.raises(KeyError, match="nope"):
+        BlockSampler(_mixed_book(), ["lin", "nope"], 1.0)
+
+
+def test_block_sampler_transform_rejects_a_mis_shaped_block():
+    """A row-count mismatch would silently pair axes with the wrong uniforms."""
+    book = _mixed_book()
+    block = BlockSampler(book, list(book), 1.0)
+    with pytest.raises(ValueError, match="rows"):
+        block.transform(torch.rand(len(book) - 1, 8))

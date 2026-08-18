@@ -169,6 +169,31 @@ class PPOConfig:
         rsl_rl_gae_approx: Ablation flag. When True, truncation bootstraps from ``V(s_t)`` instead
             of the captured terminal observation, recovering the rsl_rl approximation exactly.
         ratio_assert: Enable the epoch-0 minibatch-0 ``ratio == 1`` guard.
+        channels_last: Store the convolution weights in ``torch.channels_last`` on CUDA. The
+            observation arrives NHWC and ``ImpoolaEncoder.prepare`` permutes it, so the tensor
+            reaching every convolution is ALREADY channels-last-strided and cuDNN already selects
+            channels-last kernels for it; what this flag removes is the per-call
+            ``weight.contiguous(channels_last)`` copy cuDNN otherwise performs on every one of the
+            30 convolutions. Measured on this machine (RTX 3080 Laptop, clean process, TF32):
+            no-grad two-tower forward at N=64 17.59 -> 10.36 ms, grad step at minibatch 128
+            50.15 -> 48.47 ms. The forward is bit-identical (measured: first-step loss delta 0.0);
+            the BACKWARD selects different kernels, so after 8 optimiser steps the parameters
+            differ by up to 4.4e-5 absolute, which is inside the TF32 noise the precision policy
+            already sanctions. Ignored on CPU (where channels-last convolution is a different and
+            slower code path) and forced off in strict fp32 mode, which exists to provide a
+            bit-reproducible reference.
+        fused_optimizer: Use the fused multi-tensor CUDA Adam kernel. Same update rule, one kernel
+            instead of a foreach chain. Measured: grad step at minibatch 128 50.15 -> 39.99 ms
+            (-20%), the single largest learner-side saving available. Parameters after 8 steps
+            differ from the unfused path by up to 1.1e-5 absolute (float reassociation only).
+            Ignored on CPU and forced off in strict fp32 mode.
+        checkpoint_encoder: Recompute the encoder trunk during the backward pass instead of
+            storing its activations. Provably exact rather than merely close: the trunk is
+            deterministic (no dropout, no batch norm, no RNG), so the recomputed activations are
+            bit-identical and therefore so are the gradients. Measured at minibatch 512: peak
+            allocation 1437.6 -> 735.7 MiB (-49%) for 144.9 -> 176.6 ms (+22%). Off by default;
+            it is the lever to reach for if the N=256 update turns out to be limited by VRAM
+            residency rather than by arithmetic.
         total_timesteps: Environment-step budget for a full run.
         seed: Master seed recorded in checkpoints.
         device: Torch device string.
@@ -206,6 +231,10 @@ class PPOConfig:
 
     rsl_rl_gae_approx: bool = False
     ratio_assert: bool = True
+
+    channels_last: bool = True
+    fused_optimizer: bool = True
+    checkpoint_encoder: bool = False
 
     total_timesteps: int = 150_000_000
     seed: int = 0

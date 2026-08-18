@@ -28,6 +28,7 @@ from typing import Any, Literal
 import torch
 
 __all__ = [
+    "BlockSampler",
     "CurriculumCfg",
     "HardExampleMiner",
     "HardExampleMinerCfg",
@@ -235,6 +236,228 @@ def sample_book(
             raise KeyError(f"unknown DR axis {k!r}; book has {sorted(book)}")
         out[k] = book[k].sample(shape, alpha, generator=generator, device=device, boundary=boundary)
     return out
+
+
+class BlockSampler:
+    """Samples a whole range book in a handful of kernels instead of one per axis.
+
+    Why this exists
+    ---------------
+
+    :meth:`Range.sample` is the readable, obviously-correct form: one ``torch.rand`` and one
+    small elementwise transform per axis. At 17 axes and 15 Hz that is roughly 85 CUDA launches
+    per control step, and the M-phase profile measured ``VisualDR.sample`` at 5.97 ms MEDIAN per
+    call on a machine whose GPU sits at 12% utilisation and 780 MHz. The arithmetic is nothing;
+    the cost is entirely per-launch latency on a serialised dispatch path.
+
+    This class collapses that to one ``torch.rand`` over the whole ``(K, N)`` block plus one
+    fused transform per *mode group*: about ten launches for the same seventeen axes.
+
+    What it does NOT change
+    -----------------------
+
+    Given the same uniforms, every axis comes out bit-for-bit identical to
+    :meth:`Range._sample_scalar_alpha`, and ``tests/unit/test_visual_dr.py`` asserts exactly
+    that. The coefficients are precomputed in python ``float`` (i.e. f64) and only then rounded
+    to f32, which is what torch does to a python-float operand of an f32 tensor op, so the two
+    agree to the last bit rather than to a tolerance.
+
+    What it DOES change is the RNG stream: one blocked draw advances a CUDA Philox counter by a
+    different amount than ``K`` separate draws, so a seeded run does not reproduce a previous
+    run of the old code bit-for-bit. That is why every caller gates this behind an explicit,
+    off-by-default flag.
+
+    Axes are grouped by sampling mode, and the block's ROW ORDER follows the grouping, so each
+    group's rows are a contiguous slice of the draw and no gather kernel is needed to pick them
+    out.
+
+    Args:
+        book: The range book to sample.
+        keys: Axis names; the block's row order is a permutation of these, reported by
+            :attr:`order`.
+        alpha: Curriculum scalar. Fixed at construction because the coefficients depend on it;
+            :meth:`matches` reports when the cache has gone stale.
+        device: Device the coefficient tensors live on.
+
+    Raises:
+        KeyError: If a requested axis is not in the book.
+    """
+
+    def __init__(
+        self,
+        book: RangeBook,
+        keys: Sequence[str],
+        alpha: float,
+        *,
+        device: torch.device | str | None = None,
+    ) -> None:
+        self.alpha = float(alpha)
+        self.device = device
+        missing = [k for k in keys if k not in book]
+        if missing:
+            raise KeyError(f"unknown DR axes {missing!r}; book has {sorted(book)}")
+
+        a = self.alpha
+        affine: list[str] = []
+        exponential: list[str] = []
+        integral: list[str] = []
+        # (multiplier, offset) for the affine group, (log-span, log-offset, outer scale) for the
+        # exponential one, (span, floor) for the integer one. Every coefficient is computed in
+        # python floats and rounded to f32 exactly once, on the way into the tensor, which is
+        # what makes the fused transform bit-identical to the scalar one.
+        aff_mul: list[float] = []
+        aff_off: list[float] = []
+        exp_mul: list[float] = []
+        exp_off: list[float] = []
+        exp_scale: list[float] = []
+        int_span: list[float] = []
+        int_off: list[float] = []
+
+        for key in keys:
+            rng = book[key]
+            if rng.mode == "log_from_zero":
+                log_lo, log_hi = math.log(rng.lo), math.log(rng.hi)
+                exponential.append(key)
+                exp_mul.append(log_hi - log_lo)
+                exp_off.append(log_lo)
+                exp_scale.append(a)
+            elif rng.mode == "log":
+                n = rng.nominal
+                e_lo, e_hi = a * math.log(rng.lo / n), a * math.log(rng.hi / n)
+                exponential.append(key)
+                exp_mul.append(e_hi - e_lo)
+                exp_off.append(e_lo)
+                exp_scale.append(n)
+            else:
+                lo = rng.nominal + a * (rng.lo - rng.nominal)
+                hi = rng.nominal + a * (rng.hi - rng.nominal)
+                if rng.mode == "int":
+                    lo_i, hi_i = round(lo), round(hi)
+                    integral.append(key)
+                    int_span.append(float(max(hi_i - lo_i + 1, 1)))
+                    int_off.append(float(lo_i))
+                else:
+                    affine.append(key)
+                    aff_mul.append(hi - lo)
+                    aff_off.append(lo)
+
+        self._affine = tuple(affine)
+        self._exponential = tuple(exponential)
+        self._integral = tuple(integral)
+        self.order: tuple[str, ...] = self._affine + self._exponential + self._integral
+        self.num_axes = len(self.order)
+
+        def _col(values: list[float]) -> torch.Tensor:
+            """Return coefficients as a ``(K, 1)`` f32 column, ready to broadcast over envs.
+
+            Args:
+                values: One coefficient per axis of the group.
+
+            Returns:
+                The column tensor.
+            """
+            return torch.tensor(values, dtype=torch.float32, device=device).reshape(-1, 1)
+
+        self._aff_mul, self._aff_off = _col(aff_mul), _col(aff_off)
+        self._exp_mul, self._exp_off, self._exp_scale = _col(exp_mul), _col(exp_off), _col(exp_scale)
+        self._int_span, self._int_off = _col(int_span), _col(int_off)
+
+    def matches(self, keys: Sequence[str], alpha: float, device: Any) -> bool:
+        """Return whether this sampler is still the right one for a call.
+
+        Args:
+            keys: The axis names the caller wants.
+            alpha: The curriculum scalar the caller wants.
+            device: The device the caller wants.
+
+        Returns:
+            True when the cached coefficients can be reused unchanged.
+        """
+        return self.alpha == float(alpha) and self.device == device and sorted(self.order) == sorted(keys)
+
+    def draw(
+        self,
+        num_envs: int,
+        *,
+        generator: torch.Generator | None = None,
+        boundary: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Draw the ``(num_axes, num_envs)`` uniform block that :meth:`transform` consumes.
+
+        Args:
+            num_envs: Number of parallel environments.
+            generator: Torch generator (determinism).
+            boundary: Optional ``(num_envs,)`` ADR boundary-probe mask. Where it is True the axis
+                is forced to one of its two live clamps with probability 0.5 each, drawn
+                independently per axis, which is the rule :meth:`Range.sample` applies.
+
+        Returns:
+            A ``(num_axes, num_envs)`` f32 tensor of uniforms in [0, 1).
+        """
+        size = (self.num_axes, int(num_envs))
+        u = torch.rand(size, generator=generator, device=self.device, dtype=torch.float32)
+        if boundary is None:
+            return u
+        edge = torch.rand(size, generator=generator, device=self.device, dtype=torch.float32)
+        return torch.where(boundary.to(torch.bool).reshape(1, -1), (edge < 0.5).to(u.dtype), u)
+
+    def transform(self, u: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Turn a uniform block into one sampled tensor per axis.
+
+        Args:
+            u: The ``(num_axes, num_envs)`` block from :meth:`draw`, whose row order must be
+                :attr:`order`.
+
+        Returns:
+            ``{axis_name: (num_envs,) tensor}``. ``int``-mode axes come back as ``torch.long``
+            and every other mode as ``torch.float32``, matching :meth:`Range.sample`.
+
+        Raises:
+            ValueError: If ``u`` does not have exactly one row per axis.
+        """
+        if u.shape[0] != self.num_axes:
+            raise ValueError(f"expected {self.num_axes} rows, got {tuple(u.shape)}")
+        out: dict[str, torch.Tensor] = {}
+        start = 0
+
+        stop = start + len(self._affine)
+        if self._affine:
+            values = u[start:stop] * self._aff_mul + self._aff_off
+            out.update(zip(self._affine, values, strict=True))
+        start = stop
+
+        stop = start + len(self._exponential)
+        if self._exponential:
+            values = torch.exp(u[start:stop] * self._exp_mul + self._exp_off) * self._exp_scale
+            out.update(zip(self._exponential, values, strict=True))
+        start = stop
+
+        if self._integral:
+            span = self._int_span
+            values = (torch.clamp(torch.floor(u[start:] * span), max=span - 1.0) + self._int_off).to(
+                torch.long
+            )
+            out.update(zip(self._integral, values, strict=True))
+        return out
+
+    def sample(
+        self,
+        num_envs: int,
+        *,
+        generator: torch.Generator | None = None,
+        boundary: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Draw and transform in one call.
+
+        Args:
+            num_envs: Number of parallel environments.
+            generator: Torch generator (determinism).
+            boundary: Optional ``(num_envs,)`` ADR boundary-probe mask.
+
+        Returns:
+            ``{axis_name: (num_envs,) tensor}``.
+        """
+        return self.transform(self.draw(num_envs, generator=generator, boundary=boundary))
 
 
 @dataclass

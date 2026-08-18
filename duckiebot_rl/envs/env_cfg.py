@@ -50,6 +50,7 @@ __all__ = [
     "CitySettings",
     "LaneFollowSettings",
     "ObstacleSettings",
+    "PerfSettings",
     "RateSettings",
     "RenderingSettings",
     "SpaceSettings",
@@ -346,6 +347,50 @@ class ObstacleSettings:
             raise ValueError(f"margin_m must be >= 0, got {self.margin_m}")
 
 
+@dataclass(frozen=True)
+class PerfSettings:
+    """Throughput switches that must not change what the experiment measures.
+
+    Every field here exists because the M-phase profile named a specific measured cost, and
+    every field is reported through :meth:`LaneFollowSettings.summary` so that a checkpoint
+    records which of them a run was trained under. A performance switch that is invisible in the
+    run summary is a silent confound.
+
+    The first two are semantics-preserving and default to True; the third reorders an RNG stream
+    and therefore defaults to False.
+
+    Attributes:
+        hoist_actuation_writes: Call ``_apply_action`` and ``scene.write_data_to_sim`` once per
+            CONTROL step rather than once per PHYSICS step. Sound because the wheel targets are
+            constant across the decimation window by design and the actuator is implicit; the
+            full argument, and the four run-time guards that withdraw the hoist when it stops
+            holding, are in :mod:`duckiebot_rl.envs.step_loop`. Profile rank 1: 39.1 ms of a
+            340.7 ms control step at ``N=64``.
+        hoist_scene_updates: Call ``scene.update`` once per control step, with the whole window's
+            ``dt``, rather than once per physics step. The lazy asset and sensor buffers are
+            timestamp-driven and are only read after the window closes, so every tensor this
+            environment reads is unchanged; the finite-differenced diagnostics
+            (``data.joint_acc``, ``data.body_acc_w``) become window-differenced instead of
+            substep-differenced, and this repository has no consumer of either. Profile rank 1:
+            17.0 ms of a 340.7 ms control step at ``N=64``.
+        fused_visual_dr_draws: Draw the 17 per-step photometric DR axes as one blocked
+            ``torch.rand`` instead of 17 sequential ones (profile rank 4: 8.3 ms per control step
+            in ``VisualDR.sample``, dominated by launch latency, not arithmetic).
+
+            **Defaults to False and needs an explicit sign-off to enable.** The marginal
+            distribution of every axis is provably identical (``tests/unit/test_visual_dr.py``
+            proves the fused and looped transforms agree bit-for-bit given the same uniforms, and
+            that the two paths agree exactly end-to-end on CPU), but a CUDA Philox stream advances
+            by a different offset for one large draw than for 17 small ones, so a seeded run does
+            not reproduce a previous run's trajectory bit-for-bit across the switch. Flipping it
+            starts a new reproducibility lineage.
+    """
+
+    hoist_actuation_writes: bool = True
+    hoist_scene_updates: bool = True
+    fused_visual_dr_draws: bool = False
+
+
 @dataclass
 class LaneFollowSettings:
     """The complete S5 environment specification, with no Isaac import anywhere.
@@ -368,6 +413,9 @@ class LaneFollowSettings:
         dynamics_dr: Enable the S7.3 dynamics randomization in the action path.
         dr_alpha_vis: Initial visual curriculum scalar.
         dr_alpha_dyn: Initial dynamics curriculum scalar.
+        perf: See :class:`PerfSettings`. Throughput switches only; nothing here may change what
+            the policy or the learner sees, and the one switch that changes an RNG stream is
+            off by default.
     """
 
     num_envs: int = 256
@@ -385,6 +433,7 @@ class LaneFollowSettings:
     dynamics_dr: bool = True
     dr_alpha_vis: float = 0.0
     dr_alpha_dyn: float = 0.0
+    perf: PerfSettings = field(default_factory=PerfSettings)
 
     def __post_init__(self) -> None:
         """Validate the aggregate.
@@ -439,6 +488,9 @@ class LaneFollowSettings:
             "use_image": self.use_image,
             "visual_dr": self.visual_dr,
             "dynamics_dr": self.dynamics_dr,
+            "perf_hoist_actuation_writes": self.perf.hoist_actuation_writes,
+            "perf_hoist_scene_updates": self.perf.hoist_scene_updates,
+            "perf_fused_visual_dr_draws": self.perf.fused_visual_dr_draws,
         }
 
 

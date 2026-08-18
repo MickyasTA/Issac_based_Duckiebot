@@ -713,6 +713,15 @@ class BatchedLaneGraph:
 
         Returns:
             ``(B,)`` signed curvature in ``1/m``; positive turns left.
+
+        Note:
+            The hop loop is branchless on purpose. It used to break out of the loop as soon as
+            ``overflow.any()`` was False, which cost one device-to-host sync per hop: the M-phase
+            census measured 2.78 of them per control step, on the critical path of the
+            privileged observation, in a rollout that was already spending 88% of its GPU idle.
+            Once ``overflow`` is all-False both ``torch.where`` calls are the identity, so
+            running the remaining hops unconditionally produces the identical tensor and lets the
+            whole lane query stay in the queue.
         """
         vidx = torch.as_tensor(variant_idx, dtype=torch.long, device=self.device).reshape(-1)
         cur = seg_id.clone()
@@ -720,8 +729,6 @@ class BatchedLaneGraph:
         for _ in range(max_hops):
             seg_len = self.seg_length[vidx, cur]
             overflow = remaining > seg_len
-            if not bool(overflow.any()):
-                break
             nxt = self.seg_primary[vidx, cur]
             remaining = torch.where(overflow, remaining - seg_len, remaining)
             cur = torch.where(overflow, nxt, cur)

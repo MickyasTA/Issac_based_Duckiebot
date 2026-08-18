@@ -75,6 +75,8 @@ EXCLUDED_DIRS: frozenset[str] = frozenset(
         "site-packages",
         "_research",  # research dumps: gitignored, holds the contaminated prototypes
         "_refs",  # vendor reference downloads: gitignored
+        ".tmp",  # local scratch for one-off probe scripts and frame strips: gitignored
+        "_remeasure_tmp",  # redirected run roots from throughput measurements: training output
         "checkpoints",  # training output: weights and metrics, never geometry
         "runs",
         "training_results",  # house-standard run root: models, CSVs and generated graph PNGs

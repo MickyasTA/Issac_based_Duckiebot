@@ -352,6 +352,41 @@ class RolloutBuffer:
             image=image,
         )
 
+    def terminal_inputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Return the captured terminal observations awaiting a critic pass.
+
+        Split out of :meth:`compute_terminal_values` so that the learner can concatenate this
+        batch with the last-step bootstrap observation and evaluate BOTH in a single critic
+        forward instead of two (see :meth:`duckiebot_rl.ppo.ppo.PPO.compute_returns`). The
+        critic is a pure function of each row, so batching rows together changes no result.
+
+        Returns:
+            Tuple ``(step_index, env_index, vec_priv, image)`` sliced to the filled rows;
+            ``image`` is None in vec-only mode. ``step_index.numel()`` is tensor metadata, so
+            reading the count does not synchronise with the device.
+        """
+        step_index, env_index, vec_priv, image = self.terminal_cache.entries()
+        return step_index, env_index, vec_priv, image
+
+    @torch.no_grad()
+    def scatter_terminal_values(
+        self,
+        step_index: torch.Tensor,
+        env_index: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        """Zero ``term_values`` and write the evaluated terminal values into their slots.
+
+        Args:
+            step_index: ``(K,)`` rollout time indices from :meth:`terminal_inputs`.
+            env_index: ``(K,)`` environment indices from :meth:`terminal_inputs`.
+            values: ``(K,)`` REAL-scale critic values for those terminal observations.
+        """
+        self.term_values.zero_()
+        if step_index.numel() == 0:
+            return
+        self.term_values[step_index, env_index] = values.to(dtype=self.term_values.dtype)
+
     @torch.no_grad()
     def compute_terminal_values(
         self,
@@ -366,12 +401,11 @@ class RolloutBuffer:
         Returns:
             Number of cached terminals that were evaluated.
         """
-        self.term_values.zero_()
-        step_index, env_index, vec_priv, image = self.terminal_cache.entries()
+        step_index, env_index, vec_priv, image = self.terminal_inputs()
         if step_index.numel() == 0:
+            self.term_values.zero_()
             return 0
-        values = value_fn(image, vec_priv).to(dtype=self.term_values.dtype)
-        self.term_values[step_index, env_index] = values
+        self.scatter_terminal_values(step_index, env_index, value_fn(image, vec_priv))
         return int(step_index.numel())
 
     @torch.no_grad()

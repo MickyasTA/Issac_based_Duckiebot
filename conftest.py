@@ -12,6 +12,10 @@ Three things happen here:
 3. ``DUCKIEBOT_RL_STRICT_FP32`` is exported for every test session (SPEC v2 S6.5): TF32 is
    disabled and the PPO ratio assert tightens from 5e-3 to 1e-5. The M4 gate runs in this mode,
    so the tests do too.
+4. The ``count_host_syncs`` fixture is published, so that any module can assert that a hot path
+   performs no device-to-host synchronisation. The M-phase profile found 23.4 synchronising
+   calls per control step in a rollout whose GPU sat at 12% utilisation, and several of the
+   optimisations that removed them are one careless ``.item()`` away from coming back.
 
 Opt-in flags::
 
@@ -26,9 +30,12 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+import torch
 
 _REPO_ROOT = Path(__file__).resolve().parent
 if str(_REPO_ROOT) not in sys.path:
@@ -105,3 +112,60 @@ def strict_fp32() -> bool:
         True when ``DUCKIEBOT_RL_STRICT_FP32`` is set to a truthy value.
     """
     return os.environ.get("DUCKIEBOT_RL_STRICT_FP32", "0") not in ("", "0", "false", "False")
+
+
+@pytest.fixture
+def count_host_syncs() -> Callable[[], object]:
+    """Return a context manager that counts device-to-host synchronising tensor calls.
+
+    Usage::
+
+        with count_host_syncs() as syncs:
+            hot_path()
+            assert syncs() == 0
+
+    On a CPU-only runner none of the counted calls actually stalls anything, which is precisely
+    why counting the CALL is the right instrument: the call site is identical on CUDA, where it
+    costs a pipeline stall, and CI has no GPU. ``torch.Tensor`` attributes are restored on exit
+    even if the body raises.
+
+    Returns:
+        A zero-argument context-manager factory yielding a counter callable.
+    """
+    names = ("item", "tolist", "cpu", "numpy", "__bool__", "__float__", "__int__", "nonzero")
+
+    @contextmanager
+    def counter() -> Iterator[Callable[[], int]]:
+        """Patch the synchronising methods for the duration of the block.
+
+        Yields:
+            A callable returning the number of synchronising calls made so far.
+        """
+        originals = {name: getattr(torch.Tensor, name) for name in names}
+        total = [0]
+
+        def wrap(fn: Callable) -> Callable:
+            """Return ``fn`` wrapped in a call counter.
+
+            Args:
+                fn: The original ``torch.Tensor`` method.
+
+            Returns:
+                The counting wrapper.
+            """
+
+            def wrapper(*args: object, **kwargs: object) -> object:
+                total[0] += 1
+                return fn(*args, **kwargs)
+
+            return wrapper
+
+        for name, fn in originals.items():
+            setattr(torch.Tensor, name, wrap(fn))
+        try:
+            yield lambda: total[0]
+        finally:
+            for name, fn in originals.items():
+                setattr(torch.Tensor, name, fn)
+
+    return counter

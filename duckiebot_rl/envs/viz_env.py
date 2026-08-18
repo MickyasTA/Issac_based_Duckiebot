@@ -91,6 +91,8 @@ class IsaacVizEnv:
             env: A ``DuckiebotLaneFollowEnv`` built with ``num_envs=1``.
         """
         self.env = env
+        self._chase: Any = None
+        self._chase_failed = False
 
     @property
     def control_dt(self) -> float:
@@ -157,8 +159,8 @@ class IsaacVizEnv:
             extras,
         )
 
-    def render_frame(self) -> np.ndarray | None:
-        """Return the current RGB frame for recording.
+    def _pov_frame(self) -> np.ndarray | None:
+        """Return the robot's onboard camera frame.
 
         Returns:
             An ``(H, W, 3)`` uint8 frame, or None when no camera is present.
@@ -173,6 +175,86 @@ class IsaacVizEnv:
         if frame.dtype != np.uint8:
             frame = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
         return frame[..., :3]
+
+    def _ensure_chase_camera(self) -> Any:
+        """Create the third-person chase camera on first use.
+
+        A plain ``isaacsim.sensors.camera.Camera`` alongside the Isaac Lab scene: its render
+        product updates on the same ``sim.render()`` the env already performs each control step,
+        so the extra cost is one more 640x360 render, not a second pipeline.
+
+        Returns:
+            The camera, or None when it could not be created (recorded once, then silent).
+        """
+        if self._chase is not None or self._chase_failed:
+            return self._chase
+        try:
+            from isaacsim.core.utils.extensions import enable_extension
+
+            # the camera sensor ships as an extension and is not on sys.path until enabled
+            enable_extension("isaacsim.sensors.camera")
+            from isaacsim.sensors.camera import Camera
+
+            self._chase = Camera(
+                prim_path="/World/chase_cam",
+                resolution=(640, 360),
+                position=np.array([0.0, 0.0, 1.0]),
+            )
+            self._chase.initialize()
+        except Exception as exc:
+            print(f"[viz_env] chase camera unavailable, falling back to onboard view: {exc!r}")
+            self._chase_failed = True
+            self._chase = None
+        return self._chase
+
+    def _update_chase_pose(self) -> None:
+        """Place the chase camera behind and above the robot, looking down at it."""
+        import torch  # noqa: F401 - ensures torch is initialised before reading device tensors
+
+        data = self.env._robot.data
+        pos = data.root_pos_w[0].detach().cpu().numpy()
+        w, x, y, z = (float(v) for v in data.root_quat_w[0].detach().cpu())
+        yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        # High and steep enough to clear the city's perimeter walls; a low chase camera ends
+        # up inside them and streams a gray frame (measured, not guessed).
+        back, height, pitch = 0.72, 0.55, np.deg2rad(33.0)
+        cam_pos = np.array([pos[0] - back * np.cos(yaw), pos[1] - back * np.sin(yaw), pos[2] + height])
+        # world camera axes: +X forward, +Z up. q = qz(yaw) * qy(pitch) tilts the forward axis
+        # down toward the robot. wxyz order.
+        cy, sy = np.cos(yaw / 2.0), np.sin(yaw / 2.0)
+        cp, sp = np.cos(pitch / 2.0), np.sin(pitch / 2.0)
+        # Hamilton product qz(yaw) x qy(pitch), wxyz: [cy cp, -sy sp, cy sp, sy cp]. The y
+        # component is cy*sp; writing cp*sp only matches at yaw 0 and mis-rolls the camera in
+        # every turn (measured as the ground plane swallowing the frame).
+        quat = np.array([cy * cp, -sy * sp, cy * sp, sy * cp])
+        self._chase.set_world_pose(cam_pos, quat, camera_axes="world")
+
+    def render_frame(self) -> np.ndarray | None:
+        """Return the current view for recording and live streaming.
+
+        The third-person chase view showing the robot in the 3D city, falling back to the
+        onboard camera when the chase camera is unavailable.
+
+        Returns:
+            An ``(H, W, 3)`` uint8 frame, or None when no camera works at all.
+        """
+        chase = self._ensure_chase_camera()
+        if chase is None:
+            return self._pov_frame()
+        try:
+            self._update_chase_pose()
+            rgba = chase.get_rgba()
+            if rgba is None or getattr(rgba, "size", 0) == 0:
+                return self._pov_frame()
+            frame = np.asarray(rgba)
+            if frame.dtype != np.uint8:
+                frame = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
+            return frame[..., :3]
+        except Exception as exc:
+            print(f"[viz_env] chase render failed, using onboard view: {exc!r}")
+            self._chase_failed = True
+            self._chase = None
+            return self._pov_frame()
 
     def close(self) -> None:
         """Close the wrapped environment."""

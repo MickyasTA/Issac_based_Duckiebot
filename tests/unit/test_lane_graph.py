@@ -644,3 +644,75 @@ def test_lane_construction_rejects_inconsistent_geometry() -> None:
     # a different but still self-consistent convention simply moves the radii
     arcs = [s for s in segments if s.is_arc]
     assert sorted({round(s.radius / city.tile_size, 4) for s in arcs}) == [0.28, 0.72]
+
+
+# =============================================================================================
+# curvature_at_lookahead: branchless hops (profile rank 5)
+# =============================================================================================
+
+
+def _curvature_with_early_break(
+    batched: BatchedLaneGraph,
+    variant_idx: torch.Tensor,
+    seg_id: torch.Tensor,
+    s: torch.Tensor,
+    distance: float,
+    max_hops: int = 4,
+) -> torch.Tensor:
+    """Return the lookahead curvature using the ORIGINAL early-breaking hop loop.
+
+    Transcribed from the implementation as it stood before the branch was removed, so that the
+    branchless version is compared against the thing it replaced rather than against itself.
+
+    Args:
+        batched: A ``BatchedLaneGraph``.
+        variant_idx: ``(B,)`` variant index.
+        seg_id: ``(B,)`` current segment.
+        s: ``(B,)`` arc length within the segment.
+        distance: Lookahead distance in metres.
+        max_hops: Maximum segment transitions to follow.
+
+    Returns:
+        ``(B,)`` signed curvature.
+    """
+    vidx = torch.as_tensor(variant_idx, dtype=torch.long, device=batched.device).reshape(-1)
+    cur = seg_id.clone()
+    remaining = s + float(distance)
+    for _ in range(max_hops):
+        seg_len = batched.seg_length[vidx, cur]
+        overflow = remaining > seg_len
+        if not bool(overflow.any()):
+            break
+        nxt = batched.seg_primary[vidx, cur]
+        remaining = torch.where(overflow, remaining - seg_len, remaining)
+        cur = torch.where(overflow, nxt, cur)
+    return batched.seg_curvature[vidx, cur]
+
+
+@pytest.mark.parametrize("distance", [0.0, 0.05, 0.3, 1.0, 5.0, 40.0])
+def test_branchless_curvature_is_bit_identical_to_the_early_breaking_loop(graph, distance):
+    """Once ``overflow`` is all-False both ``where`` calls are the identity, so the hops are free.
+
+    The distances span a lookahead that never overflows (where the old loop broke on hop 1), the
+    S5.2 lookahead of 0.3 m, and one long enough to exhaust every hop on every env.
+    """
+    batched = BatchedLaneGraph([graph])
+    generator = torch.Generator().manual_seed(4)
+    count = 96
+    num_segments = int(batched.seg_valid[0].sum())
+    variant_idx = torch.zeros(count, dtype=torch.long)
+    seg_id = torch.randint(0, num_segments, (count,), generator=generator)
+    s = torch.rand(count, generator=generator) * batched.seg_length[0, seg_id]
+
+    branchless = batched.curvature_at_lookahead(variant_idx, seg_id, s, distance)
+    reference = _curvature_with_early_break(batched, variant_idx, seg_id, s, distance)
+    assert torch.equal(branchless, reference)
+
+
+def test_curvature_lookahead_performs_no_host_sync(graph, count_host_syncs):
+    """Profile rank 5: the early break cost up to 4 syncs per control step on the critic path."""
+    batched = BatchedLaneGraph([graph])
+    seg_id = torch.zeros(16, dtype=torch.long)
+    with count_host_syncs() as syncs:
+        batched.curvature_at_lookahead(torch.zeros(16, dtype=torch.long), seg_id, torch.zeros(16), 0.3)
+        assert syncs() == 0

@@ -347,6 +347,29 @@ def _open_window(backend: Any, requested: bool | None) -> Any:
     return handle
 
 
+def _write_live_frame(directory: Path, frame: Any) -> None:
+    """Atomically publish the newest annotated frame as ``live_frame.png``.
+
+    A watch page polls this file at about 1 Hz, which turns the headless viewer into a live
+    on-screen Isaac view without a second Kit process. Failures are swallowed: a dropped live
+    frame must never end an episode.
+
+    Args:
+        directory: The run's ``obs/`` directory.
+        frame: The annotated RGB frame.
+    """
+    try:
+        import imageio.v2 as iio
+
+        # A distinct stem keeps the extension ".png" so imageio can infer the encoder; a
+        # ".png.tmp" suffix makes imwrite raise (and the raise would be swallowed below).
+        tmp = directory / "live_frame_next.png"
+        iio.imwrite(tmp, frame)
+        tmp.replace(directory / "live_frame.png")
+    except Exception:
+        pass
+
+
 def run_episode(
     backend: Any,
     host: PolicyHost,
@@ -356,6 +379,7 @@ def run_episode(
     record: bool,
     poll_every: int,
     window: Any,
+    live_frame_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Drive one episode, polling for new checkpoints as it goes.
 
@@ -366,6 +390,7 @@ def run_episode(
         episode: Episode index, for logging.
         seed: Episode seed.
         record: Capture frames for the video.
+        live_frame_dir: Directory to stream ``live_frame.png`` into every other step, or None.
         poll_every: Control steps between checkpoint polls.
         window: Passive viewer handle, or None.
 
@@ -403,6 +428,8 @@ def run_episode(
                     ],
                 )
             )
+            if live_frame_dir is not None and steps % 2 == 0:
+                _write_live_frame(live_frame_dir, frames[-1])
         if window is not None:
             window.sync()
             if not window.is_running():
@@ -501,7 +528,10 @@ def main(argv: list[str] | None = None) -> int:
         f"[live_view] backend={args.backend} map={args.map} control_dt={backend.control_dt:.4f}s "
         f"action={'sampled' if args.stochastic else 'deterministic mean'}"
     )
-    window = _open_window(backend, args.window)
+    # The interactive window is the MuJoCo passive viewer; on the Isaac backend the view comes
+    # from the recorded frames and the live_frame stream (Kit's editor GUI hard-crashes when a
+    # plain script steps the env underneath it, measured on this machine at uptime 21 s).
+    window = _open_window(backend, args.window) if args.backend == "mujoco" else None
     poll_every = max(round(args.poll_interval / max(backend.control_dt, 1e-6)), 1)
 
     episode = 0
@@ -518,6 +548,7 @@ def main(argv: list[str] | None = None) -> int:
                 record=args.record,
                 poll_every=poll_every,
                 window=window,
+                live_frame_dir=(run_dir / "obs") if args.record else None,
             )
             if result["reason"] == "window closed":
                 break

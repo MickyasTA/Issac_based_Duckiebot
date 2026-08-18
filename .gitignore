@@ -114,3 +114,4 @@ desktop.ini
 
 # Local scratch for one-off probe scripts
 .tmp/
+_remeasure_tmp/

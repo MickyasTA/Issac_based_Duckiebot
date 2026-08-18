@@ -86,12 +86,14 @@ from duckiebot_rl.city.spec import geometry_buckets
 from duckiebot_rl.dr.curriculum import HardExampleMiner, HardExampleMinerCfg, TwoScalarADR
 from duckiebot_rl.dr.dynamics import DynamicsRandomizer, quantize_encoder
 from duckiebot_rl.dr.preprocess import FrameStack, preprocess_frame
-from duckiebot_rl.dr.visual import VisualDR, sample_camera_mount, sample_frame_repeat
+from duckiebot_rl.dr.visual import VisualDR, VisualDRCfg, sample_camera_mount, sample_frame_repeat
 from duckiebot_rl.envs.action_path import TorchActionPath
 from duckiebot_rl.envs.camera_math import quat_cam_ros_torch
+from duckiebot_rl.envs.episode_log import DeviceLog
 from duckiebot_rl.envs.obstacles import NO_OBSTACLE_DISTANCE, ObstacleField, lane_frame_to_world
 from duckiebot_rl.envs.rewards import RewardWeights, compute_reward
-from duckiebot_rl.envs.terminations import TerminationState
+from duckiebot_rl.envs.step_loop import APPLY, PHYSICS, RENDER, UPDATE, WRITE, run_window, window_ops
+from duckiebot_rl.envs.terminations import TerminationFlags, TerminationState
 
 __all__ = ["DuckiebotLaneFollowEnv"]
 
@@ -213,7 +215,12 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
 
         # --- domain randomization --------------------------------------------------------
         self._dynamics_dr = DynamicsRandomizer(n, device=device, generator=self._generator)
-        self._visual_dr = VisualDR(n, device=device, generator=self._generator)
+        self._visual_dr = VisualDR(
+            n,
+            VisualDRCfg(fused_draws=self.settings.perf.fused_visual_dr_draws),
+            device=device,
+            generator=self._generator,
+        )
         self._alpha_vis = float(self.settings.dr_alpha_vis)
         self._alpha_dyn = float(self.settings.dr_alpha_dyn)
         self._miner = HardExampleMiner(
@@ -226,7 +233,7 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         self._adr: TwoScalarADR | None = None
         self._probe_vis = torch.zeros(n, dtype=torch.bool, device=device)
         self._probe_dyn = torch.zeros(n, dtype=torch.bool, device=device)
-        self._curriculum_records: dict[str, list[float]] = {"vis": [], "dyn": []}
+        self._curriculum_records = DeviceLog()
 
         # --- action path -----------------------------------------------------------------
         self._action_path = TorchActionPath(n, self.step_dt, params, device=device, generator=self._generator)
@@ -247,6 +254,11 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         self._vec = torch.zeros(n, spaces.vec_dim, device=device)
         self._vec_priv = torch.zeros(n, spaces.priv_dim, device=device)
         self._pending_refill = torch.zeros(n, dtype=torch.bool, device=device)
+        # Host-side mirror of "is `_pending_refill` non-empty". The mask itself is a device
+        # tensor, so testing it costs a sync on EVERY control step even though it is False on
+        # the 62.5% of steps at N=64 that contain no reset (profile rank 9). The flag is set in
+        # `_reset_idx` and cleared in `_get_observations`, which are the only two writers.
+        self._pending_refill_any = False
 
         # --- obstacles ---------------------------------------------------------------------
         self._obstacle_field = ObstacleField(n, self._lane, device=device, generator=self._generator)
@@ -264,7 +276,8 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         self._arc_s = torch.zeros(n, device=device)
         self._body_speed = torch.zeros(n, device=device)
         self._reward_terms: dict[str, torch.Tensor] = {}
-        self._termination_counts: dict[str, int] = {}
+        self._flags: TerminationFlags | None = None
+        self._counts_cache: dict[str, int] | None = None
         self._in_step = False
         self._buffer: Any = None
 
@@ -273,9 +286,13 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         self._ep_abs_d_integral = torch.zeros(n, device=device)
         self._ep_out_of_lane_integral = torch.zeros(n, device=device)
         self._ep_return = torch.zeros(n, device=device)
-        self._episode_log: dict[str, list[float]] = {}
-        self._finished_spawn_slots: list[int] = []
-        self._finished_errors: list[float] = []
+        # Accumulated as DEVICE tensors, one chunk per reset, and drained to the host once per
+        # training iteration; see `duckiebot_rl.envs.episode_log`. Holding python floats here
+        # instead meant a `.cpu().tolist()` burst inside every `_reset_idx`, which at N=64 fires
+        # on 37.5% of control steps: profile rank 6 measured 41.2 ms per reset, 15.4 ms
+        # amortised per control step, and the fraction of steps that pay it grows with N.
+        self._episode_log = DeviceLog()
+        self._spawn_log = DeviceLog()
 
         # --- D14 external push -----------------------------------------------------------------
         self._push_timer = torch.zeros(n, device=device)
@@ -363,6 +380,134 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         """
         self._robot.set_joint_velocity_target(self._wheel_targets, joint_ids=self._wheel_ids)
 
+    # =========================================================================================
+    # The decimation window (profile rank 1)
+    # =========================================================================================
+
+    def _hoistable(self) -> bool:
+        """Return whether the constant-actuation writes may be hoisted out of the window.
+
+        The four preconditions are stated and argued in :mod:`duckiebot_rl.envs.step_loop`. Two
+        of them are properties of this class and cannot change at run time (the wheel target is
+        computed once per control step; nothing reads the per-substep torque diagnostics). The
+        other two are properties of the assets, so they are checked here, every step, cheaply:
+
+        * every actuator on the robot must be an implicit one, and
+        * no articulation or rigid-object collection in the scene may have an external wrench in
+          flight, because ``write_data_to_sim`` re-applies external wrenches precisely BECAUSE
+          PhysX clears them on every ``simulate()``.
+
+        Both checks are python attribute reads on host-side objects. There is no device work and
+        no host sync, which is what lets them run unconditionally rather than being a start-up
+        assertion that a later change could invalidate.
+
+        Returns:
+            True when :func:`~duckiebot_rl.envs.step_loop.window_ops` may hoist.
+        """
+        if not self.settings.perf.hoist_actuation_writes:
+            return False
+        for actuator in self._robot.actuators.values():
+            if not getattr(actuator, "is_implicit_model", False):
+                return False
+        entities = (
+            *self.scene.articulations.values(),
+            *self.scene.rigid_objects.values(),
+            *self.scene.rigid_object_collections.values(),
+        )
+        for entity in entities:
+            for name in ("_instantaneous_wrench_composer", "_permanent_wrench_composer"):
+                composer = getattr(entity, name, None)
+                if composer is not None and getattr(composer, "active", False):
+                    return False
+        return True
+
+    def _run_physics_window(self) -> None:
+        """Run one control step's worth of physics, writing the constant actuation once.
+
+        This replaces the inner loop of ``DirectRLEnv.step`` and nothing else. The physics steps
+        and the renders are identical in count and in interleaving to the base class's, because
+        :func:`~duckiebot_rl.envs.step_loop.window_ops` derives them from the same
+        ``_sim_step_counter % render_interval`` rule; only the repeated actuation write and the
+        repeated lazy-buffer timestamp bump are collapsed.
+
+        When :meth:`_hoistable` says no, the emitted plan IS the base class's loop, op for op.
+        """
+        decimation = int(self.cfg.decimation)
+        start = int(self._sim_step_counter)
+        hoist = self._hoistable()
+        ops = window_ops(
+            start,
+            decimation,
+            int(self.cfg.sim.render_interval),
+            self.sim.has_gui() or self.sim.has_rtx_sensors(),
+            hoist_writes=hoist,
+            hoist_updates=hoist and self.settings.perf.hoist_scene_updates,
+        )
+        # One trailing `scene.update` must advance the lazy buffers by the WHOLE window, not by
+        # one substep: `SensorBase.update` accumulates `dt` into the timestamp it compares
+        # against `update_period`, so feeding it a sixteenth of the elapsed time would make a
+        # rate-limited sensor fire sixteen times too slowly.
+        update_dt = self.physics_dt * (decimation if ops.count(UPDATE) == 1 else 1)
+
+        def _physics() -> None:
+            self._sim_step_counter += 1
+            self.sim.step(render=False)
+
+        run_window(
+            ops,
+            {
+                APPLY: self._apply_action,
+                WRITE: self.scene.write_data_to_sim,
+                PHYSICS: _physics,
+                RENDER: self.sim.render,
+                UPDATE: lambda: self.scene.update(dt=update_dt),
+            },
+        )
+
+    def step(self, action: torch.Tensor) -> tuple[Any, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        """Advance one control step; ``DirectRLEnv.step`` with the physics window replaced.
+
+        Everything outside the decimation window is the base class's code verbatim, in the base
+        class's order, because that order is what this environment's whole snapshot design is
+        built around (see the module docstring). The one substantive difference is
+        :meth:`_run_physics_window`.
+
+        Args:
+            action: ``(N, 2)`` raw policy action.
+
+        Returns:
+            ``(obs, reward, terminated, truncated, extras)``, exactly as ``DirectRLEnv.step``.
+        """
+        action = action.to(self.device)
+        if self.cfg.action_noise_model:
+            action = self._action_noise_model(action)
+
+        self._pre_physics_step(action)
+        self._run_physics_window()
+
+        self.episode_length_buf += 1
+        self.common_step_counter += 1
+
+        self.reset_terminated[:], self.reset_time_outs[:] = self._get_dones()
+        self.reset_buf = self.reset_terminated | self.reset_time_outs
+        self.reward_buf = self._get_rewards()
+
+        reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        if len(reset_env_ids) > 0:
+            self._reset_idx(reset_env_ids)
+            if self.sim.has_rtx_sensors() and self.cfg.num_rerenders_on_reset > 0:
+                for _ in range(self.cfg.num_rerenders_on_reset):
+                    self.sim.render()
+
+        if self.cfg.events and "interval" in self.event_manager.available_modes:
+            self.event_manager.apply(mode="interval", dt=self.step_dt)
+
+        self.obs_buf = self._get_observations()
+        if self.cfg.observation_noise_model:
+            self.obs_buf["policy"] = self._observation_noise_model(self.obs_buf["policy"])
+
+        return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
+
     def _advance_obstacles(self) -> None:
         """Advance the kinematic obstacle field and push the new poses into PhysX."""
         if self._obstacles is None:
@@ -421,8 +566,29 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
             self.max_episode_length,
             self.settings.params,
         )
-        self._termination_counts = flags.counts()
+        # Deliberately NOT `flags.counts()`. That call is a host sync, `_get_dones` runs on
+        # every control step, and the counts are read only when an episode actually ended
+        # (`scripts/train.py:termination_reason`) or once per iteration (`drain_episode_log`).
+        # Keeping the masks and materialising the dict on demand is profile rank 5: it removed
+        # 7 of the 23.4 synchronizing calls per control step without changing a single number.
+        self._flags = flags
+        self._counts_cache = None
         return flags.terminated, flags.truncated
+
+    @property
+    def _termination_counts(self) -> dict[str, int]:
+        """``{condition_name: count}`` for the last completed step, materialised on demand.
+
+        Private-by-name because ``scripts/train.py`` reads it through ``getattr`` and because it
+        was a plain attribute before the sync census; the name is part of the interface with the
+        learner side and is kept.
+
+        Returns:
+            The counts of the most recent ``_get_dones``, or an empty dict before the first one.
+        """
+        if self._counts_cache is None:
+            self._counts_cache = {} if self._flags is None else self._flags.counts()
+        return self._counts_cache
 
     def _snapshot(self) -> None:
         """Read physics once, build the lane query, the obstacle query and the observation."""
@@ -605,13 +771,14 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
             ``{"policy": {"rgb": ..., "vec": ...}}``, with the ``rgb`` key absent in vec-only
             mode. The critic's view is served separately by :meth:`_get_states`.
         """
-        if self._frames is not None and bool(self._pending_refill.any()):
+        if self._frames is not None and self._pending_refill_any:
             assert self._camera is not None
             ids = self._pending_refill.nonzero(as_tuple=False).squeeze(-1)
             frame = self._camera.data.output["rgb"][ids].clone()
             self._frames.reset(ids, preprocess_frame(frame))
             self._stacked_obs = self._frames.get()
             self._pending_refill[:] = False
+            self._pending_refill_any = False
 
         self._in_step = False
         policy: dict[str, torch.Tensor] = {"vec": self._vec}
@@ -766,6 +933,7 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         self._ep_return[ids] = 0.0
         # The frame ring is refilled in _get_observations, after the post-reset render.
         self._pending_refill[ids] = True
+        self._pending_refill_any = True
 
         # Stagger the very first all-env reset. Doing it here rather than in __init__ is what
         # makes it survive: super()._reset_idx zeroes episode_length_buf, so a stagger applied
@@ -923,18 +1091,17 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
             "episode/abs_d_integral_ms": self._ep_abs_d_integral[ids],
             "episode/out_of_lane_integral_ms": self._ep_out_of_lane_integral[ids],
         }
-        for key, value in entries.items():
-            self._episode_log.setdefault(key, []).extend(value.detach().cpu().tolist())
-
-        self._finished_spawn_slots.extend(self._spawn_slot[ids].detach().cpu().tolist())
-        self._finished_errors.extend(self._ep_abs_d_integral[ids].detach().cpu().tolist())
+        # Everything below stays on the device. Each of these is a fresh tensor (advanced
+        # indexing copies), so none of them aliases a per-env buffer that `_reset_idx` is about
+        # to zero, and the drain reads exactly the values this reset produced.
+        self._episode_log.extend(entries)
+        self._spawn_log.extend({"slot": self._spawn_slot[ids], "error": self._ep_abs_d_integral[ids]})
 
         # The ADR success metric is the S7.4 one: mean lane-frame consecutive distance in tiles.
         tiles = entries["episode/distance_tiles"]
-        for name, mask in (("vis", self._probe_vis[ids]), ("dyn", self._probe_dyn[ids])):
-            selected = tiles[mask]
-            if selected.numel():
-                self._curriculum_records[name].extend(selected.detach().cpu().tolist())
+        self._curriculum_records.extend(
+            {"vis": tiles[self._probe_vis[ids]], "dyn": tiles[self._probe_dyn[ids]]}
+        )
 
     def drain_episode_log(self) -> dict[str, float]:
         """Return and clear the accumulated per-episode metrics.
@@ -945,14 +1112,12 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         Returns:
             ``{metric_name: mean_over_completed_episodes}``, empty when nothing finished.
         """
-        if self._finished_spawn_slots:
-            self._miner.update(self._finished_spawn_slots, self._finished_errors)
-            self._finished_spawn_slots = []
-            self._finished_errors = []
+        if self._spawn_log.pending:
+            spawn = self._spawn_log.drain()
+            self._miner.update(spawn["slot"], spawn["error"])
             self._error_table = None
-        out = {key: sum(values) / len(values) for key, values in self._episode_log.items() if values}
+        out = self._episode_log.drain_means()
         out.update({f"terminations/{k}": float(v) for k, v in self._termination_counts.items()})
-        self._episode_log = {}
         return out
 
     def reward_term_means(self) -> dict[str, float]:
@@ -987,9 +1152,8 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         Returns:
             ``{"vis": [distance_tiles, ...], "dyn": [...]}``, ready for ``TwoScalarADR.record``.
         """
-        out = {name: list(values) for name, values in self._curriculum_records.items()}
-        self._curriculum_records = {"vis": [], "dyn": []}
-        return out
+        drained = self._curriculum_records.drain()
+        return {name: drained.get(name, []) for name in ("vis", "dyn")}
 
     def set_curriculum_alphas(self, alpha_vis: float, alpha_dyn: float) -> None:
         """Set the two auto-DR scalars.

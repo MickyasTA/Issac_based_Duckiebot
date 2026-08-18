@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from duckiebot_rl.dr import visual as V
-from duckiebot_rl.dr.curriculum import Range
+from duckiebot_rl.dr.curriculum import BlockSampler, Range
 
 N = 6
 H, W = 128, 192
@@ -293,3 +293,115 @@ def test_camera_mount_matches_spec_s2_nominal():
     assert float(wide["height_m"].max()) <= 0.120 + 1e-6
     assert float(wide["pitch_down_rad"].min()) >= 15.0 * math.pi / 180.0 - 1e-6
     assert float(wide["pitch_down_rad"].max()) <= 28.0 * math.pi / 180.0 + 1e-6
+
+
+# =============================================================================================
+# Fused per-step draws (profile rank 4)
+# =============================================================================================
+#
+# `VisualDR.sample` costs 5.97 ms MEDIAN per control step in Kit at N=64, essentially all of it
+# CUDA launch latency across ~85 tiny kernels for 17 axes. `fused_draws=True` routes the book
+# through `BlockSampler`, which does the identical arithmetic in about ten launches.
+#
+# The switch is OFF by default and stays off until someone signs off, because one blocked
+# `torch.rand` advances a CUDA Philox counter differently from 17 small ones: the distributions
+# are unchanged but a seeded run stops reproducing the old run bit-for-bit. These tests draw
+# that line precisely - identical GIVEN THE SAME UNIFORMS, identical marginals, and NOT claimed
+# to be identical stream-for-stream on CUDA.
+
+
+def test_fused_draws_are_off_by_default():
+    """A switch that reorders an RNG stream must never arrive silently enabled."""
+    assert V.VisualDRCfg().fused_draws is False
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.25, 1.0])
+def test_fused_transform_is_bit_identical_given_the_same_uniforms(alpha):
+    """The two paths differ only in HOW the uniforms are drawn, never in what is done to them."""
+    book = V.default_visual_ranges()
+    block = BlockSampler(book, list(book), alpha)
+    u = block.draw(32, generator=torch.Generator().manual_seed(19))
+
+    fused = block.transform(u)
+    for row, name in enumerate(block.order):
+        reference = book[name]._sample_scalar_alpha(u[row], alpha)
+        assert torch.equal(fused[name], reference), name
+
+
+def test_fused_sample_returns_the_same_axes_with_the_same_shapes_and_dtypes():
+    """`VisualParams` is built by keyword; a missing or mistyped axis must fail here, not in Kit."""
+    looped = _dr(seed=1).sample(0.6)
+    fused = _dr(seed=1, fused_draws=True).sample(0.6)
+    for field in looped.__dataclass_fields__:
+        a, b = getattr(looped, field), getattr(fused, field)
+        assert a.shape == b.shape, field
+        assert a.dtype == b.dtype, field
+
+
+@pytest.mark.parametrize("alpha", [0.0, 1.0])
+def test_fused_sample_respects_the_live_range_of_every_axis(alpha):
+    """Distributional equivalence where it is checkable exactly: the support."""
+    book = V.default_visual_ranges()
+    dr = V.VisualDR(4096, V.VisualDRCfg(fused_draws=True), generator=torch.Generator().manual_seed(5))
+    params = dr.sample(alpha)
+    for name, rng in book.items():
+        if name == "blur_len_px":
+            continue  # scaled by speed_frac downstream; covered by its own tests
+        lo, hi = rng.live(alpha)
+        values = getattr(params, name)
+        assert float(values.min()) >= lo - 1e-6, name
+        assert float(values.max()) <= hi + 1e-6, name
+
+
+def test_fused_sample_is_exactly_identity_at_alpha_zero():
+    """At alpha = 0 every axis must collapse to its nominal, fused or not (S7.4)."""
+    looped = _dr(seed=2).sample(0.0)
+    fused = _dr(seed=2, fused_draws=True).sample(0.0)
+    for field in looped.__dataclass_fields__:
+        assert torch.equal(getattr(looped, field), getattr(fused, field)), field
+
+
+def test_fused_sample_is_deterministic_under_a_seed():
+    """Reproducibility WITHIN the fused lineage is not negotiable, only across the switch."""
+    a = _dr(seed=7, fused_draws=True).sample(0.5)
+    b = _dr(seed=7, fused_draws=True).sample(0.5)
+    for field in a.__dataclass_fields__:
+        assert torch.equal(getattr(a, field), getattr(b, field)), field
+
+
+def test_fused_boundary_probes_land_on_the_live_clamps():
+    """The ADR boundary probe is what makes an ADR measurement about the boundary (S7.4)."""
+    book = V.default_visual_ranges()
+    alpha = 0.7
+    dr = V.VisualDR(512, V.VisualDRCfg(fused_draws=True), generator=torch.Generator().manual_seed(3))
+    boundary = torch.ones(512, dtype=torch.bool)
+    params = dr.sample(alpha, boundary=boundary)
+
+    for name in ("exposure_log2", "contrast", "vignette"):
+        lo, hi = book[name].live(alpha)
+        values = getattr(params, name)
+        assert (
+            torch.isclose(values, torch.tensor(lo)).logical_or(torch.isclose(values, torch.tensor(hi))).all()
+        ), name
+
+
+def test_fused_and_looped_agree_axis_for_axis_on_a_cpu_generator():
+    """On CPU the MT19937 stream concatenates, so the two paths coincide exactly.
+
+    This is the strongest statement available without a GPU, and it is deliberately NOT
+    generalised to CUDA: Philox rounds its offset up per launch, so the blocked draw consumes a
+    different slice of the stream there. What transfers is the arithmetic, which
+    `test_fused_transform_is_bit_identical_given_the_same_uniforms` pins independently.
+    """
+    book = V.default_visual_ranges()
+    alpha = 0.4
+    num_envs = 16
+
+    block = BlockSampler(book, list(book), alpha, device=torch.device("cpu"))
+    u = block.draw(num_envs, generator=torch.Generator().manual_seed(23))
+    fused = block.transform(u)
+
+    generator = torch.Generator().manual_seed(23)
+    looped = {name: book[name].sample(num_envs, alpha, generator=generator) for name in block.order}
+    for name in block.order:
+        assert torch.equal(fused[name], looped[name]), name
