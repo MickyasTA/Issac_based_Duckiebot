@@ -91,7 +91,7 @@ from duckiebot_rl.envs.action_path import TorchActionPath
 from duckiebot_rl.envs.camera_math import quat_cam_ros_torch
 from duckiebot_rl.envs.episode_log import DeviceLog
 from duckiebot_rl.envs.obstacles import NO_OBSTACLE_DISTANCE, ObstacleField, lane_frame_to_world
-from duckiebot_rl.envs.rewards import RewardWeights, compute_reward
+from duckiebot_rl.envs.rewards import RewardWeights, compute_reward, wrong_lane_indicator
 from duckiebot_rl.envs.step_loop import APPLY, PHYSICS, RENDER, UPDATE, WRITE, run_window, window_ops
 from duckiebot_rl.envs.terminations import TerminationFlags, TerminationState
 
@@ -285,6 +285,7 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         self._ep_distance = torch.zeros(n, device=device)
         self._ep_abs_d_integral = torch.zeros(n, device=device)
         self._ep_out_of_lane_integral = torch.zeros(n, device=device)
+        self._ep_wrong_lane_s = torch.zeros(n, device=device)
         self._ep_return = torch.zeros(n, device=device)
         # Accumulated as DEVICE tensors, one chunk per reset, and drained to the host once per
         # training iteration; see `duckiebot_rl.envs.episode_log`. Holding python floats here
@@ -719,11 +720,28 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         return dx, dy
 
     def _accumulate_episode_stats(self) -> None:
-        """Fold this step into the four AI-DO-style online metrics of SPEC v2 S6.8."""
+        """Fold this step into the AI-DO-style online metrics of SPEC v2 S6.8.
+
+        ``out_of_lane_integral`` is corrected for the lane re-match (2026-08-18). The lane graph
+        matches a pose to the NEAREST lane, so a robot that has fully crossed the yellow line is
+        re-matched to the oncoming lane and its ``|d|`` collapses back toward zero: measured on
+        ``city_000``, ``|d|`` falls from 0.103 m to 0.003 m as the robot continues across. The
+        raw ``clip(|d| - w/2, 0)`` integral therefore stops accumulating exactly when the robot
+        is most thoroughly out of its lane, and reports a sustained wrong-lane run as zero.
+
+        :func:`duckiebot_rl.envs.rewards.wrong_lane_indicator` detects that case from ``psi``,
+        which the re-match does not hide. While it fires, the excursion is charged at no less
+        than a half-lane width, so the integral is monotone through a full crossing instead of
+        collapsing at the far side of it.
+        """
         half_lane = 0.5 * self._lane_width
+        wrong_lane = wrong_lane_indicator(self._psi)
+        excursion = torch.clamp(self._d.abs() - half_lane, min=0.0)
+        excursion = torch.where(wrong_lane > 0.0, torch.maximum(excursion, half_lane), excursion)
         self._ep_distance += torch.clamp(self._ds, min=0.0)
         self._ep_abs_d_integral += self._d.abs() * self.step_dt
-        self._ep_out_of_lane_integral += torch.clamp(self._d.abs() - half_lane, min=0.0) * self.step_dt
+        self._ep_out_of_lane_integral += excursion * self.step_dt
+        self._ep_wrong_lane_s += wrong_lane * self.step_dt
 
     def _get_rewards(self) -> torch.Tensor:
         """Evaluate the SPEC v2 S5.4 reward from the cached snapshot.
@@ -930,6 +948,7 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
         self._ep_distance[ids] = 0.0
         self._ep_abs_d_integral[ids] = 0.0
         self._ep_out_of_lane_integral[ids] = 0.0
+        self._ep_wrong_lane_s[ids] = 0.0
         self._ep_return[ids] = 0.0
         # The frame ring is refilled in _get_observations, after the post-reset render.
         self._pending_refill[ids] = True
@@ -1090,6 +1109,7 @@ class DuckiebotLaneFollowEnv(DirectRLEnv):
             "episode/distance_tiles": distance / tile_metres,
             "episode/abs_d_integral_ms": self._ep_abs_d_integral[ids],
             "episode/out_of_lane_integral_ms": self._ep_out_of_lane_integral[ids],
+            "episode/wrong_lane_s": self._ep_wrong_lane_s[ids],
         }
         # Everything below stays on the device. Each of these is a fresh tensor (advanced
         # indexing copies), so none of them aliases a per-env buffer that `_reset_idx` is about

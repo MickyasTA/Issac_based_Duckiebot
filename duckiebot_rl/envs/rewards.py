@@ -53,22 +53,26 @@ import torch
 from duckiebot_rl.assets.params import DUCKIEBOT
 
 __all__ = [
+    "LANE_DEPARTURE_CAP",
     "PROGRESS_GATE_MARGIN_M",
     "PSI_TARGET_LOOKAHEAD_M",
     "PSI_TARGET_MAX_RAD",
     "REWARD_CLIP",
     "RewardTerms",
     "RewardWeights",
+    "clear_half_lane",
     "compute_reward",
     "leaky_cos",
     "psi_target",
     "r_heading",
+    "r_lane_departure",
     "r_lateral",
     "r_progress",
     "r_proximity",
     "r_smooth",
     "stall_indicator",
     "terminal_reward",
+    "wrong_lane_indicator",
 ]
 
 PSI_TARGET_LOOKAHEAD_M: float = 0.05
@@ -82,6 +86,17 @@ PROGRESS_GATE_MARGIN_M: float = 0.02
 
 REWARD_CLIP: float = 20.0
 """Symmetric clip applied to the total reward including the terminal penalty (S5.4)."""
+
+LANE_DEPARTURE_CAP: float = 3.0
+"""Ceiling of :func:`r_lane_departure`, in half-lane widths beyond the clear lane.
+
+The point of the term is to have a live gradient everywhere the robot can physically be, so the
+cap is placed OUTSIDE the reachable set rather than at the lane edge. Measured on ``city_000``
+(``tile_size`` 0.570 m, ``w_ep`` 0.2046 m) the widest on-road excursion from a lane centreline
+is about 0.25 m on a curve tile, which is 2.44 half-lane widths; beyond 3.0 the off-drivable
+termination has already fired. Contrast :func:`r_lateral`, whose bound is reached AT the lane
+edge and which is therefore numerically flat over the entire out-of-lane region.
+"""
 
 
 @dataclass(frozen=True)
@@ -103,6 +118,32 @@ class RewardWeights:
         stall: Weight SUBTRACTED for each stalled step.
         terminal: Penalty added on a true termination (collision or off-drivable). Never applied
             on truncation, which is bootstrapped instead (S6.4).
+        departure: Weight of :func:`r_lane_departure`, the lane-discipline fix (see below).
+        wrong_lane: Weight SUBTRACTED while :func:`wrong_lane_indicator` fires.
+        two_sided_progress_gate: Gate :func:`r_progress` on ``|d|`` rather than on signed ``d``.
+
+    The lane-discipline fix (2026-08-18) and how to undo it
+    -------------------------------------------------------
+
+    The v1 weights above let a policy leave its lane and keep almost all of its income. Measured
+    on ``city_000`` by sweeping the robot sideways across a lane and evaluating this reward at
+    each offset (the on-centre step reward is +7.00):
+
+    * On a CURVE tile the robot can sit 0.25 m from the centreline - 2.44 half-lane widths,
+      squarely across the white edge line - and still be on drivable tiles, still collect the
+      FULL 6.0-weighted progress term, and pay a total of only +4.25 per step. That is 61 % of
+      the on-centre reward for being completely out of the lane.
+    * The reason is two independent holes. ``r_progress`` gated on signed ``d < gate``, which
+      locks the yellow/oncoming side only and never fires for the white/outer side; and
+      ``r_lateral`` saturates AT the lane edge, its gradient falling from -6.8e-02 /m at one
+      half-lane width to -6.8e-08 /m at three, so nothing pulls the robot back once it is out.
+    * The training run of 2026-08-18 shows the consequence: over iterations 0 to 281 the mean
+      episode ``out_of_lane_integral_ms`` ROSE from 0.058 to 0.173 while the return rose from
+      -6.8 to +1776. More training was buying lane indiscipline, so a longer run alone would
+      have made the reported symptom worse rather than better.
+
+    :meth:`legacy` returns the exact pre-fix weight set, so an ablation can reproduce the old
+    behaviour and the two can be compared on the same gates.
     """
 
     heading: float = 1.0
@@ -112,6 +153,23 @@ class RewardWeights:
     proximity: float = 1.0
     stall: float = 0.5
     terminal: float = -10.0
+    departure: float = 2.0
+    wrong_lane: float = 2.0
+    two_sided_progress_gate: bool = True
+
+    @classmethod
+    def legacy(cls) -> RewardWeights:
+        """Return the pre-2026-08-18 weights, with the lane-discipline terms disabled.
+
+        Both new terms are zero-weighted and the progress gate reverts to its one-sided form, so
+        :func:`compute_reward` reproduces the v1 reward exactly. Use it to re-run an ablation
+        against the checkpoints trained before the fix.
+
+        Returns:
+            A weight set that scores identically to the reward used up to iteration 281 of
+            ``20260818T034543Z_lanefollow_seed0_main_seed0``.
+        """
+        return cls(departure=0.0, wrong_lane=0.0, two_sided_progress_gate=False)
 
 
 @dataclass
@@ -125,6 +183,8 @@ class RewardTerms:
         smooth: :func:`r_smooth`.
         proximity: :func:`r_proximity`.
         stall: :func:`stall_indicator`, 1.0 where the robot is stalled.
+        departure: :func:`r_lane_departure`.
+        wrong_lane: :func:`wrong_lane_indicator`, 1.0 where the robot is in the oncoming lane.
         total: The weighted sum, before the terminal penalty and before the clip.
     """
 
@@ -134,6 +194,8 @@ class RewardTerms:
     smooth: torch.Tensor
     proximity: torch.Tensor
     stall: torch.Tensor
+    departure: torch.Tensor
+    wrong_lane: torch.Tensor
     total: torch.Tensor
 
     def as_dict(self) -> dict[str, torch.Tensor]:
@@ -216,6 +278,7 @@ def r_progress(
     robot_width: float = DUCKIEBOT.robot_width_m,
     v_max: float = DUCKIEBOT.v_cmd_max_m_s,
     control_dt: float = DUCKIEBOT.control_dt_s,
+    two_sided: bool = True,
 ) -> torch.Tensor:
     """Return the gated lane-frame progress reward (SPEC v2 S5.4).
 
@@ -224,14 +287,26 @@ def r_progress(
     term at most 1.0 per step regardless of the control rate, so the S5.4 weight of 6.0 means
     the same thing if the decimation ever changes.
 
-    The gate is the direction lock and the oncoming-lane lock in one expression:
+    The gate is the direction lock and the lane lock in one expression:
 
     * ``ds > 0`` refuses credit for driving backwards. ``ds`` is the world displacement
       projected on the lane tangent (:func:`duckiebot_rl.city.lane_graph.progress_delta`), so it
       is negative against the lane direction and continuous across tile boundaries.
-    * ``d < (lane_width - robot_width) / 2 + margin`` refuses credit once the robot has crossed
-      far enough left to be in the oncoming lane. Both widths are parameters, not the v1
-      literals 0.115 and 0.065, because V9 randomises the lane width per variant.
+    * ``|d| < (lane_width - robot_width) / 2 + margin`` refuses credit once the robot has left
+      its own lane. Both widths are parameters, not the v1 literals 0.115 and 0.065, because V9
+      randomises the lane width per variant.
+
+    Why the gate is now two-sided (2026-08-18)
+    -------------------------------------------
+
+    It used to test signed ``d < gate``, on the reasoning that the yellow side is the oncoming
+    lane while the white side is the shoulder, which the off-drivable termination already
+    guards. Measurement says the shoulder is NOT guarded on curve tiles: a curve carries enough
+    drivable area that the robot can sit 0.25 m from its lane centreline - 2.44 half-lane widths
+    - with all four off-drivable test points still on the road, and the one-sided gate paid it
+    the full 1.0 progress the whole way out. Straights do behave as the old comment assumed
+    (on-road only to 0.98 half-lane widths), which is why the hole stayed invisible: it opens
+    exactly on the curves, which is exactly where a lane-follower drifts wide.
 
     Args:
         ds: ``(N,)`` lane-frame forward progress this control step, in metres.
@@ -240,14 +315,113 @@ def r_progress(
         robot_width: Robot width in metres.
         v_max: Commanded speed cap in m/s.
         control_dt: Control period in seconds.
+        two_sided: Gate on ``|d|``. False restores the pre-fix one-sided gate.
 
     Returns:
         ``(N,)`` reward in ``[0, ~1]``.
     """
-    width = torch.as_tensor(lane_width, dtype=ds.dtype, device=ds.device)
-    gate = 0.5 * (width - robot_width) + PROGRESS_GATE_MARGIN_M
-    allowed = (ds > 0.0) & (d < gate)
+    gate = clear_half_lane(lane_width, robot_width, like=ds)
+    offset = d.abs() if two_sided else d
+    allowed = (ds > 0.0) & (offset < gate)
     return torch.where(allowed, ds / (v_max * control_dt), torch.zeros_like(ds))
+
+
+def clear_half_lane(
+    lane_width: torch.Tensor | float,
+    robot_width: float = DUCKIEBOT.robot_width_m,
+    like: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return ``(lane_width - robot_width) / 2 + margin``: the offset where the robot reaches a lane line.
+
+    Single source of the expression so :func:`r_progress` and :func:`r_lane_departure` cannot
+    drift apart: the offset at which progress stops paying is by construction the same offset at
+    which the departure penalty starts charging, and the reward therefore has no dead band
+    between them.
+
+    Args:
+        lane_width: ``(N,)`` or scalar clear lane width in metres.
+        robot_width: Robot width in metres.
+        like: Tensor supplying dtype and device; defaults to those of ``lane_width``.
+
+    Returns:
+        ``(N,)`` or scalar half-width in metres.
+    """
+    if like is None:
+        width = torch.as_tensor(lane_width)
+    else:
+        width = torch.as_tensor(lane_width, dtype=like.dtype, device=like.device)
+    return 0.5 * (width - robot_width) + PROGRESS_GATE_MARGIN_M
+
+
+def r_lane_departure(
+    d: torch.Tensor,
+    lane_width: torch.Tensor | float,
+    robot_width: float = DUCKIEBOT.robot_width_m,
+    cap: float = LANE_DEPARTURE_CAP,
+) -> torch.Tensor:
+    """Return a LINEAR penalty for how far outside its own lane the robot is.
+
+    ``-min(clip(|d| - clear_half_lane, 0) / (w_ep / 2), cap)``: zero inside the lane, then one
+    unit of penalty per half-lane width of excursion, capped at ``cap`` half-lane widths.
+
+    This is the term that gives the out-of-lane region a gradient. :func:`r_lateral` cannot: its
+    exponential reaches -0.999 at exactly one half-lane width, so measured on ``city_000`` its
+    slope is -6.8e-02 /m at the lane edge and -6.8e-08 /m at three half-lane widths. A policy
+    already out of its lane sees a numerically flat landscape and has nothing to descend. The
+    two terms are complementary and both are kept: the bounded exponential still does the job it
+    was designed for, which is not to dominate the return during the early flailing phase, while
+    this term supplies the restoring force outside the lane where the exponential has none.
+
+    Linear rather than quadratic on purpose. The excursion is bounded by the road, so a
+    quadratic buys nothing at the far end but does flatten the gradient near the lane edge,
+    which is the region the policy has to learn first.
+
+    Args:
+        d: ``(N,)`` signed lateral error in metres.
+        lane_width: ``(N,)`` or scalar clear lane width in metres.
+        robot_width: Robot width in metres.
+        cap: Ceiling in half-lane widths; see :data:`LANE_DEPARTURE_CAP`.
+
+    Returns:
+        ``(N,)`` penalty in ``[-cap, 0]``.
+    """
+    width = torch.as_tensor(lane_width, dtype=d.dtype, device=d.device)
+    over = torch.clamp(d.abs() - clear_half_lane(width, robot_width, like=d), min=0.0)
+    return -torch.clamp(over / (0.5 * width), max=cap)
+
+
+def wrong_lane_indicator(psi: torch.Tensor) -> torch.Tensor:
+    """Return 1.0 where the robot is matched to a lane it is travelling AGAINST.
+
+    Why this exists, and why it is not redundant with ``d``
+    -------------------------------------------------------
+
+    :class:`duckiebot_rl.city.lane_graph.BatchedLaneGraph` matches a pose to the nearest lane
+    over ALL lanes, with only a 0.002 m^2 heading tie-break. That is correct for a robot in its
+    own lane, but it means a robot that has fully crossed the yellow line is re-matched to the
+    ONCOMING lane, and every quantity derived from that match silently changes meaning: measured
+    on ``city_000``, sweeping across the centreline flips ``seg_id`` from 2 to 3 and collapses
+    ``|d|`` from 0.103 m back to 0.003 m. So ``|d|`` reports a robot squarely in the wrong lane
+    as being beautifully centred, ``r_lateral`` charges it almost nothing, and
+    ``episode/out_of_lane_integral_ms`` - which is ``clip(|d| - w/2, 0)`` integrated - stops
+    accumulating entirely. The metric is blind to exactly the failure it is named after.
+
+    ``psi`` is the one quantity the re-match does NOT hide: it flips to +/-180 degrees, because
+    the oncoming lane's tangent points the other way. Testing ``|psi| > 90 degrees`` therefore
+    detects the crossing that ``d`` conceals, and costs one comparison.
+
+    The current training maps are Hamiltonian loops with no intersections, so no legitimate
+    manoeuvre holds ``|psi| > 90 deg``. On a map with 3- or 4-way tiles a mid-turn pose can
+    momentarily match a crossing lane; treat this as an instantaneous penalty only, never as a
+    termination, unless it is first backed by a sustained counter.
+
+    Args:
+        psi: ``(N,)`` heading error in radians against the matched lane.
+
+    Returns:
+        ``(N,)`` float, 1.0 where the robot faces against its matched lane.
+    """
+    return (psi.abs() > 0.5 * math.pi).to(psi.dtype)
 
 
 def r_lateral(d: torch.Tensor, lane_width: torch.Tensor | float) -> torch.Tensor:
@@ -405,7 +579,7 @@ def compute_reward(
         and ``terms`` holds the UNWEIGHTED per-step terms for the S6.8 diagnostics.
     """
     heading = r_heading(d, psi)
-    progress = r_progress(ds, d, lane_width, robot_width, v_max, control_dt)
+    progress = r_progress(ds, d, lane_width, robot_width, v_max, control_dt, weights.two_sided_progress_gate)
     lateral = r_lateral(d, lane_width)
     smooth = r_smooth(action, prev_action)
     if gap is None or prev_gap is None:
@@ -413,6 +587,8 @@ def compute_reward(
     else:
         proximity = r_proximity(gap, prev_gap)
     stall = stall_indicator(body_speed, stall_speed)
+    departure = r_lane_departure(d, lane_width, robot_width)
+    wrong_lane = wrong_lane_indicator(psi)
 
     total = (
         weights.heading * heading
@@ -421,6 +597,8 @@ def compute_reward(
         + weights.smooth * smooth
         + weights.proximity * proximity
         - weights.stall * stall
+        + weights.departure * departure
+        - weights.wrong_lane * wrong_lane
     )
     terms = RewardTerms(
         heading=heading,
@@ -429,6 +607,8 @@ def compute_reward(
         smooth=smooth,
         proximity=proximity,
         stall=stall,
+        departure=departure,
+        wrong_lane=wrong_lane,
         total=total,
     )
     reward = total if terminated is None else total + terminal_reward(terminated, weights)

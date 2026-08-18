@@ -157,10 +157,109 @@ def test_progress_gate_boundary_is_exactly_the_spec_expression():
     assert float(values[1]) == 0.0
 
 
-def test_progress_gate_does_not_punish_the_white_edge_side():
-    """The gate is one-sided: it blocks the oncoming lane, not the outer shoulder."""
+def test_progress_gate_is_two_sided():
+    """Leaving the lane over the WHITE edge stops paying progress, exactly as the yellow side does.
+
+    This reverses ``test_progress_gate_does_not_punish_the_white_edge_side``, which asserted the
+    old one-sided gate on the reasoning that the outer shoulder is guarded by the off-drivable
+    termination. Measured on ``city_000`` that reasoning holds on straights (on-road only to
+    0.98 half-lane widths) and fails on curves, where a curve tile carries enough drivable area
+    for the robot to sit 2.44 half-lane widths out with all four off-drivable test points still
+    on the road, collecting full progress the whole way.
+    """
     ds = t(0.02)
-    assert float(rw.r_progress(ds, t(-0.20), LANE_W, ROBOT_W, V_MAX, CONTROL_DT)) > 0.0
+    assert float(rw.r_progress(ds, t(-0.20), LANE_W, ROBOT_W, V_MAX, CONTROL_DT)) == 0.0
+    assert float(rw.r_progress(ds, t(+0.20), LANE_W, ROBOT_W, V_MAX, CONTROL_DT)) == 0.0
+    inside = rw.r_progress(ds, t(-0.01, 0.01), LANE_W, ROBOT_W, V_MAX, CONTROL_DT)
+    assert bool((inside > 0.0).all())
+
+
+def test_progress_gate_is_symmetric_about_the_centreline():
+    """The same |d| pays the same on either side of the centreline."""
+    ds = t(0.02, 0.02)
+    for offset in (0.01, 0.05, 0.09, 0.20):
+        left, right = rw.r_progress(ds, t(offset, -offset), LANE_W, ROBOT_W, V_MAX, CONTROL_DT)
+        assert float(left) == pytest.approx(float(right), abs=1e-9)
+
+
+def test_progress_gate_one_sided_mode_restores_the_old_behaviour():
+    """``two_sided=False`` reproduces the pre-fix gate, for ablation against old checkpoints."""
+    ds = t(0.02)
+    legacy = rw.r_progress(ds, t(-0.20), LANE_W, ROBOT_W, V_MAX, CONTROL_DT, False)
+    assert float(legacy) > 0.0
+
+
+# =============================================================================================
+# r_lane_departure and wrong_lane_indicator (the 2026-08-18 lane-discipline terms)
+# =============================================================================================
+
+
+def test_lane_departure_is_zero_inside_the_lane():
+    """No charge until the robot body actually reaches a lane line."""
+    gate = 0.5 * (LANE_W - ROBOT_W) + rw.PROGRESS_GATE_MARGIN_M
+    values = rw.r_lane_departure(t(0.0, 0.5 * gate, gate - 1e-4), LANE_W, ROBOT_W)
+    assert bool((values == 0.0).all())
+
+
+def test_lane_departure_starts_exactly_where_progress_stops_paying():
+    """No dead band: the offset that gates progress off is the offset that starts charging."""
+    gate = 0.5 * (LANE_W - ROBOT_W) + rw.PROGRESS_GATE_MARGIN_M
+    ds = t(0.02, 0.02)
+    d = t(gate - 1e-4, gate + 1e-3)
+    progress = rw.r_progress(ds, d, LANE_W, ROBOT_W, V_MAX, CONTROL_DT)
+    departure = rw.r_lane_departure(d, LANE_W, ROBOT_W)
+    assert float(progress[0]) > 0.0 and float(departure[0]) == 0.0
+    assert float(progress[1]) == 0.0 and float(departure[1]) < 0.0
+
+
+def test_lane_departure_grows_linearly_in_half_lane_widths():
+    """One unit of penalty per half-lane width beyond the lane edge."""
+    gate = 0.5 * (LANE_W - ROBOT_W) + rw.PROGRESS_GATE_MARGIN_M
+    half = 0.5 * LANE_W
+    values = rw.r_lane_departure(t(gate + half, gate + 2.0 * half), LANE_W, ROBOT_W)
+    assert float(values[0]) == pytest.approx(-1.0, abs=1e-6)
+    assert float(values[1]) == pytest.approx(-2.0, abs=1e-6)
+
+
+def test_lane_departure_is_symmetric_and_capped():
+    values = rw.r_lane_departure(t(-0.6, 0.6), LANE_W, ROBOT_W)
+    assert float(values[0]) == pytest.approx(float(values[1]), abs=1e-9)
+    assert float(values[0]) == pytest.approx(-rw.LANE_DEPARTURE_CAP, abs=1e-6)
+
+
+def test_lane_departure_keeps_a_gradient_where_the_lateral_term_has_none():
+    """The whole point of the term: a restoring force outside the lane.
+
+    ``r_lateral`` saturates at the lane edge, so its slope one lane width further out has
+    collapsed to nothing. ``r_lane_departure`` holds a constant slope over the entire reachable
+    range, so the ratio is enormous rather than marginal.
+    """
+    d = t(0.25).requires_grad_(True)
+    rw.r_lateral(d, LANE_W).sum().backward()
+    lateral_slope = abs(float(d.grad))
+    d2 = t(0.25).requires_grad_(True)
+    rw.r_lane_departure(d2, LANE_W, ROBOT_W).sum().backward()
+    departure_slope = abs(float(d2.grad))
+    assert lateral_slope < 1e-4
+    assert departure_slope > 1.0
+    assert departure_slope > 1000.0 * lateral_slope
+
+
+def test_wrong_lane_indicator_fires_only_against_the_matched_lane():
+    values = rw.wrong_lane_indicator(t(0.0, 0.5, -0.5, math.pi, -math.pi, 0.5 * math.pi + 0.01))
+    assert [float(v) for v in values] == [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+
+
+def test_wrong_lane_indicator_catches_the_crossing_that_d_hides():
+    """A robot re-matched to the oncoming lane reads |d| ~ 0 but psi ~ 180 degrees.
+
+    This is the case that made ``episode/out_of_lane_integral_ms`` blind to sustained wrong-lane
+    driving: every ``d``-derived quantity says "perfectly centred".
+    """
+    d, psi = t(0.003), t(math.pi)
+    assert float(rw.r_lateral(d, LANE_W)) > -0.2
+    assert float(rw.r_lane_departure(d, LANE_W, ROBOT_W)) == 0.0
+    assert float(rw.wrong_lane_indicator(psi)) == 1.0
 
 
 # =============================================================================================
@@ -316,6 +415,8 @@ def test_reward_terms_are_reported_unweighted_for_logging():
         "smooth",
         "proximity",
         "stall",
+        "departure",
+        "wrong_lane",
         "total",
     }
 
@@ -353,6 +454,7 @@ def _rollout(
     length: float,
     mode: str,
     steps: int = 18,
+    weights: rw.RewardWeights | None = None,
 ) -> float:
     """Roll one behaviour along a lane segment and return the total S5.4 reward.
 
@@ -360,8 +462,9 @@ def _rollout(
         lane: The batched lane graph.
         segment: Segment index to drive along.
         length: Length of that segment in metres.
-        mode: ``"clean"``, ``"spin"``, ``"hug"`` or ``"backward"``.
+        mode: ``"clean"``, ``"spin"``, ``"hug"``, ``"wide"`` or ``"backward"``.
         steps: Number of control steps.
+        weights: Weight set; defaults to the current production weights.
 
     Returns:
         The summed reward over the rollout.
@@ -371,14 +474,15 @@ def _rollout(
     speed = 0.3
     step_m = speed * CONTROL_DT
     start = 0.5 * length - 0.5 * steps * step_m
-    lateral = 0.09 if mode == "hug" else 0.0
+    lateral = {"hug": 0.09, "wide": -0.20}.get(mode, 0.0)
+    weights = rw.RewardWeights() if weights is None else weights
 
     total = 0.0
     prev_xy: torch.Tensor | None = None
     prev_action = torch.zeros(1, 2)
     lane_width = lane.lane_width[:1]
     for i in range(steps):
-        if mode == "clean" or mode == "hug":
+        if mode in ("clean", "hug", "wide"):
             arc = torch.tensor([start + i * step_m])
             heading, body_speed = 0.0, speed
             action = torch.tensor([[0.0, 0.0]])
@@ -414,6 +518,7 @@ def _rollout(
             body_speed=torch.tensor([body_speed]),
             lane_width=lane_width,
             control_dt=CONTROL_DT,
+            weights=weights,
         )
         prev_action = action
         total += float(reward)
@@ -450,3 +555,37 @@ def test_hugging_the_oncoming_lane_earns_no_progress_credit(straight_lane):
     hug = _rollout(lane, segment, length, "hug")
     clean = _rollout(lane, segment, length, "clean")
     assert hug < 0.25 * clean
+
+
+def test_drifting_wide_over_the_white_edge_is_now_unprofitable(straight_lane):
+    """The fourth degenerate policy, and the one the 2026-08-18 fix exists to price.
+
+    Driving straight and fast but 0.20 m to the WHITE side of the centreline is the behaviour a
+    lane-follower falls into on curves, where the tile is wide enough that off-drivable never
+    fires. It is the failure the user reported as the robot crossing the line into another lane.
+    """
+    lane, segment, length = straight_lane
+    wide = _rollout(lane, segment, length, "wide")
+    clean = _rollout(lane, segment, length, "clean")
+    assert wide < 0.25 * clean
+
+
+def test_the_old_weights_paid_almost_full_price_for_driving_out_of_the_lane(straight_lane):
+    """Regression pin: this is the hole, measured, in the reward that trained to iteration 281.
+
+    Under the pre-fix weights a robot driving 0.20 m outside its lane still earned a solidly
+    POSITIVE return - about 28 % of clean lane following on this rollout, and 61 % of it at full
+    commanded speed, where the progress term dominates more - because the progress gate was
+    one-sided and the lateral penalty had already saturated. Positive income is all it takes:
+    the policy needs no reason to come back, only no reason to stay. Under the current weights
+    the identical trajectory is strongly negative. If someone re-widens the gate or drops the
+    departure term, this fails here rather than 300 iterations into a training run.
+    """
+    lane, segment, length = straight_lane
+    legacy_clean = _rollout(lane, segment, length, "clean", weights=rw.RewardWeights.legacy())
+    legacy_wide = _rollout(lane, segment, length, "wide", weights=rw.RewardWeights.legacy())
+    fixed_wide = _rollout(lane, segment, length, "wide")
+    assert legacy_wide > 0.0
+    assert legacy_wide > 0.2 * legacy_clean
+    assert fixed_wide < 0.0
+    assert fixed_wide < legacy_wide
