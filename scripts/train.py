@@ -100,7 +100,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from duckiebot_rl.envs.viz_env import DEFAULT_ROBOT_MESH, ROBOT_MESH_CHOICES  # noqa: E402
+from duckiebot_rl.envs.viz_env import ROBOT_MESH_CHOICES, TRAIN_ROBOT_MESH  # noqa: E402
 from duckiebot_rl.viz.metrics_logger import EpisodeRecord  # noqa: E402
 from duckiebot_rl.viz.run_dir import DEFAULT_RESULTS_ROOT, RunDir, find_latest_run  # noqa: E402
 
@@ -179,11 +179,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--robot-mesh",
         dest="robot_mesh",
         choices=ROBOT_MESH_CHOICES,
-        default=DEFAULT_ROBOT_MESH,
+        default=TRAIN_ROBOT_MESH,
         help="robot VISUAL only, applied to all N environments: db21j is the Duckiematrix DB21, "
         "db17 the per-part classic meshes, primitive the environment's own boxes. Physics, "
         "collisions, actuation and the policy camera are identical for all three; a mesh that "
-        "is not on disk downgrades to the next one instead of failing the run",
+        "is not on disk downgrades to the next one instead of failing the run. TRAINING defaults "
+        "to primitive on throughput grounds, unlike the viewer: measured on the reference machine "
+        "at 64 envs, db21j costs 1.35x wall clock when the GPU is already power capped and about "
+        "2.4x when it is cool, and the policy cannot see any of it (the robot's own geometry is "
+        "inside the camera's near plane). Pass --robot-mesh db21j when the eval recordings matter "
+        "more than the schedule",
     )
 
     schedule = parser.add_argument_group("schedule")

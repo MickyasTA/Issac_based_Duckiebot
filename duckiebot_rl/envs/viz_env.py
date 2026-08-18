@@ -37,6 +37,7 @@ __all__ = [
     "DB21_OBJ_ROTATE_XYZ",
     "DEFAULT_ROBOT_MESH",
     "ROBOT_MESH_CHOICES",
+    "TRAIN_ROBOT_MESH",
     "IsaacVizEnv",
     "attach_robot_visuals",
     "duckiematrix_point_to_base_link",
@@ -489,6 +490,19 @@ drawn changes.
 
 DEFAULT_ROBOT_MESH = "db21j"
 """Default selector: the latest-generation robot when its mesh has been fetched."""
+
+TRAIN_ROBOT_MESH: str = "primitive"
+"""What ``scripts/train.py`` draws by default, and why it differs from the viewer's default.
+
+The visual mesh is invisible to the policy: the robot's own geometry lies inside the camera's
+0.05 m near plane, which ``tests/unit/test_robot_mesh.py`` proves vertex by vertex. It is not
+invisible to the renderer, which still processes 281k vertices per environment per frame.
+Measured on the reference machine, 64 envs, same seed and same 15 iterations: primitive averaged
+58.3 env-steps/s against db21j's 43.2 once the GPU was power capped (1.35x), and 275 against 105
+over the first three iterations while it was still cool (about 2.4x). On a 100M-step campaign
+that is days, bought for pixels no gradient ever sees, so training opts out by default and the
+viewer, whose entire product IS the pixels, opts in.
+"""
 
 _ROBOT_PRIM = "/World/envs/env_0/Robot"
 """Prim path of environment 0's robot, the one the chase camera follows."""

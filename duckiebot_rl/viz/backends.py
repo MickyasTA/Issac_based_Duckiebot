@@ -53,6 +53,7 @@ __all__ = [
     "BACKEND_NAMES",
     "DEFAULT_ROBOT_MESH",
     "ROBOT_MESH_NAMES",
+    "TRAIN_ROBOT_MESH",
     "IsaacVramRefusal",
     "MujocoBackend",
     "ParallelIsaacBackend",
@@ -76,6 +77,9 @@ no ``duckiebot_rl.envs`` at all, which is the property the whole module is built
 """
 
 DEFAULT_ROBOT_MESH = "db21j"
+
+TRAIN_ROBOT_MESH = "primitive"
+"""What training draws by default; see ``duckiebot_rl.envs.viz_env.TRAIN_ROBOT_MESH``."""
 """Default robot visual: the latest-generation DB21, when its glTF has been fetched."""
 
 ISAAC_TRAIN_VRAM_GIB = (6.4, 7.6)

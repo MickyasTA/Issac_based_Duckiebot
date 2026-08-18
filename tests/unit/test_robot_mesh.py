@@ -583,12 +583,28 @@ def isaac_free_scripts() -> tuple[Any, Any]:
     return train, check_obs
 
 
-def test_training_draws_the_real_db21_by_default(isaac_free_scripts) -> None:
-    """The flag exists on the trainer, and its default is the latest-generation robot."""
+def test_training_and_the_viewer_default_to_different_meshes(isaac_free_scripts) -> None:
+    """Training defaults to primitive, the viewer to db21j, and that split is deliberate.
+
+    The mesh cannot reach the policy: the robot's own geometry is inside the camera near plane,
+    which ``test_db21_geometry_is_behind_the_camera_near_plane`` proves vertex by vertex. It
+    still reaches the renderer, 281k vertices per environment per frame. Measured on the
+    reference machine at 64 envs, same seed, same 15 iterations: primitive averaged 58.3
+    env-steps/s against db21j's 43.2 with the GPU power capped, and roughly 2.4x that gap while
+    it was cool. Training therefore opts out and the viewer, whose product is the picture, opts
+    in. Flipping either default without re-measuring silently spends days of campaign time.
+    """
     train, _check_obs = isaac_free_scripts
-    args = train.build_parser().parse_args([])
-    assert args.robot_mesh == "db21j"
-    assert train.DEFAULT_ROBOT_MESH == "db21j"
+    assert train.build_parser().parse_args([]).robot_mesh == "primitive"
+    assert train.TRAIN_ROBOT_MESH == "primitive"
+    assert viz_env.DEFAULT_ROBOT_MESH == "db21j"
+    assert viz_env.TRAIN_ROBOT_MESH == "primitive"
+
+
+def test_the_real_db21_is_one_flag_away_for_training(isaac_free_scripts) -> None:
+    """Opting a campaign into the real robot stays a single documented flag."""
+    train, _check_obs = isaac_free_scripts
+    assert train.build_parser().parse_args(["--robot-mesh", "db21j"]).robot_mesh == "db21j"
 
 
 @pytest.mark.parametrize("choice", ["db21j", "db17", "primitive"])

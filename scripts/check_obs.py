@@ -60,8 +60,9 @@ stdout
 
 Robot visuals (``--robot-mesh``)
 -------------------------------
-``scripts/train.py`` draws the robot with the real DB21 mesh by default, so this script defaults
-to the same thing and the gate looks at what the campaign will actually render. The attachment is
+``scripts/train.py`` draws the robot as primitives by default, on the measured throughput
+grounds recorded in ``duckiebot_rl.envs.viz_env.TRAIN_ROBOT_MESH``, so pass this script the same
+``--robot-mesh`` the campaign will use and the gate looks at what that campaign renders. The attachment is
 visual-only USD under links that already exist, and the robot's own geometry sits entirely inside
 the camera's 0.05 m near plane (``tests/unit/test_robot_mesh.py`` proves that vertex by vertex
 without booting Kit), so the observation should be identical to ``--robot-mesh primitive``.

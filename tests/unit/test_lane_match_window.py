@@ -16,6 +16,7 @@ tangent ``(0, +1)``, separation 0.2340 m = two lane offsets of 0.117 m.
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import pytest
 import torch
@@ -37,7 +38,7 @@ def zigzag() -> LaneGraph:
     return LaneGraph(M.builtin_map("zigzag"))
 
 
-def _one(graph: LaneGraph, x: float, y: float, yaw: float, prev: float | None):
+def _one(graph: LaneGraph, x: float, y: float, yaw: float, prev: float | None) -> Any:
     """Query one pose, optionally with a previous route position."""
     prev_t = None if prev is None else torch.tensor([prev])
     return graph.query([x], [y], [yaw], prev_route_pos=prev_t)
@@ -172,7 +173,7 @@ def _mj_flank_pair(lane: MjLaneGraph) -> tuple[int, int, tuple[float, float], tu
 def test_mujoco_free_match_collapses_and_windowed_match_does_not() -> None:
     """The MuJoCo twin shows the same bug free and the same truth windowed (C6 parity)."""
     lane = _mj_zigzag()
-    a_seg, b_seg, ma, mb = _mj_flank_pair(lane)
+    a_seg, _, ma, mb = _mj_flank_pair(lane)
     ta = lane.segments[a_seg].tangent_at(0.0)
     heading = math.atan2(ta[1], ta[0])
 
@@ -222,6 +223,7 @@ def test_cutting_no_longer_earns_progress_credit(zigzag: LaneGraph) -> None:
     from duckiebot_rl.envs.rewards import r_progress, wrong_lane_indicator
 
     a_id, b_id, route_a = _flank_ids(zigzag)
+    _ = b_id
     x_late = B_X - 0.02
     yaw_north = math.pi / 2.0  # rotated, aligned with the far flank
     free = _one(zigzag, x_late, FLANK_Y, yaw_north, None)
