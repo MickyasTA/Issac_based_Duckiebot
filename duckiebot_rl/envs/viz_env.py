@@ -261,6 +261,200 @@ class IsaacVizEnv:
         self.env.close()
 
 
+_VISUAL_COLORS: dict[str, tuple[float, float, float]] = {
+    "chassis": (0.72, 0.07, 0.05),
+    "computer": (0.10, 0.12, 0.16),
+    "camera": (0.06, 0.06, 0.07),
+    "left_wheel": (0.05, 0.05, 0.05),
+    "right_wheel": (0.05, 0.05, 0.05),
+}
+"""Duckiebot colors: red chassis, dark electronics, black tires. The split OBJs
+carry no material, so the converter leaves them default gray, which on a gray road makes the
+robot near-invisible (measured, chase frames)."""
+
+
+def _bind_color(stage: Any, prim: Any, rgb: tuple[float, float, float]) -> None:
+    """Bind a simple colored material to a visual subtree.
+
+    Args:
+        stage: The USD stage.
+        prim: The Xform holding the referenced mesh.
+        rgb: Diffuse color.
+    """
+    from pxr import Gf, Sdf, UsdShade
+
+    path = prim.GetPath().AppendChild("mat")
+    material = UsdShade.Material.Define(stage, path)
+    shader = UsdShade.Shader.Define(stage, path.AppendChild("prev"))
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*rgb))
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.6)
+    material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+        material, bindingStrength=UsdShade.Tokens.strongerThanDescendants
+    )
+
+
+_REAL_VISUALS: tuple[tuple[str, str, tuple[float, float, float]], ...] = (
+    ("base_link", "chassis", (0.0, 0.0, 0.0)),
+    ("base_link", "computer", (0.0, 0.0, 0.0)),
+    ("base_link", "camera", (0.0, 0.0, 0.0)),
+    ("left_wheel_link", "left_wheel", (0.0, -0.05, 0.0)),
+    ("right_wheel_link", "right_wheel", (0.0, 0.05, 0.0)),
+)
+"""Real-mesh visual attachments: (link, mesh stem, translation). The wheel translations undo the
+joint offsets because the meshes are authored at their assembled pose (0.100 m baseline)."""
+
+
+def _find_visual_mesh_dir() -> Any:
+    """Locate the fetched real-robot meshes, if the user has them locally.
+
+    The meshes derive from Duckietown's CAD via gym-duckietown and are NOT redistributable, so
+    they are never committed: ``scripts/fetch_visual_mesh.py`` places them under ``_refs/`` and
+    the research prototypes are the on-disk fallback. No meshes means primitive visuals, which
+    is always correct for training; this path only upgrades the view.
+
+    Returns:
+        The directory holding ``chassis.obj`` and friends, or None.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    for candidate in (
+        root / "_refs" / "visual_mesh",
+        root / "_research" / "prototypes" / "db2" / "meshes",
+    ):
+        if (candidate / "chassis.obj").is_file():
+            return candidate
+    return None
+
+
+def _attach_real_visuals(env: Any) -> None:
+    """Swap the primitive robot visuals for the real Duckiebot meshes, viewer-side only.
+
+    Physics, collisions and the camera are untouched: the meshes are added as pure visual
+    references and the primitive visual scopes are hidden. Every failure falls back to the
+    primitive look, because the view must never take the session down.
+
+    Args:
+        env: The constructed ``DuckiebotLaneFollowEnv``.
+    """
+    mesh_dir = _find_visual_mesh_dir()
+    if mesh_dir is None:
+        return
+    try:
+        import asyncio
+
+        import omni.kit.asset_converter as asset_converter
+        import omni.usd
+        from isaacsim.core.utils.extensions import enable_extension
+        from pxr import Gf, Sdf, UsdGeom
+
+        enable_extension("omni.kit.asset_converter")
+
+        usd_dir = mesh_dir.parent / "visual_usd"
+        usd_dir.mkdir(parents=True, exist_ok=True)
+
+        async def _convert(src: Any, dst: Any) -> bool:
+            task = asset_converter.get_instance().create_converter_task(str(src), str(dst), None)
+            return await task.wait_until_finished()
+
+        loop = asyncio.get_event_loop()
+        converted: dict[str, Any] = {}
+        for _, stem, _ in _REAL_VISUALS:
+            src, dst = mesh_dir / f"{stem}.obj", usd_dir / f"{stem}.usd"
+            if not dst.is_file() and not loop.run_until_complete(_convert(src, dst)):
+                print(f"[viz_env] mesh convert failed for {stem}; keeping primitive visuals")
+                return
+            converted[stem] = dst
+
+        from pxr import Usd
+
+        expected_m = {
+            "chassis": 0.200,
+            "computer": 0.095,
+            "camera": 0.040,
+            "left_wheel": 0.066,
+            "right_wheel": 0.066,
+        }
+        stage = omni.usd.get_context().get_stage()
+        bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"])
+        robot = "/World/envs/env_0/Robot"
+
+        # The latest-generation robot: duckietown-world's duckiebot3 glTF (DB21, tall camera
+        # mast, back plate), fetched from behind Git LFS by scripts/fetch_visual_mesh.py. When
+        # present it replaces the whole per-part DB17 path below.
+        db21 = mesh_dir.parent / "visual_mesh" / "db21" / "main.gltf"
+        if not db21.is_file():
+            from pathlib import Path as _P
+
+            db21 = _P(__file__).resolve().parents[2] / "_refs" / "visual_mesh" / "db21" / "main.gltf"
+        if db21.is_file():
+            dst = db21.with_suffix(".usd")
+            if not dst.is_file() and not loop.run_until_complete(_convert(db21, dst)):
+                print("[viz_env] db21 convert failed; falling back to per-part meshes")
+            else:
+                xform = UsdGeom.Xform.Define(stage, f"{robot}/base_link/real_db21")
+                xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.0))
+                orient_op = xform.AddRotateXYZOp()
+                orient_op.Set(Gf.Vec3f(0.0))
+                scale_op = xform.AddScaleOp()
+                scale_op.Set(Gf.Vec3f(1.0))
+                xform.GetPrim().GetReferences().AddReference(str(dst))
+                bbox_cache.Clear()
+                size = bbox_cache.ComputeWorldBound(xform.GetPrim()).ComputeAlignedRange().GetSize()
+                dims = f"{size[0]:.4f} x {size[1]:.4f} x {size[2]:.4f}"
+                print(f"[viz_env] db21: bbox {dims} m")
+                # glTF is Y-up; if the mast landed along Y instead of Z the model is lying down.
+                if size[1] > 1.5 * max(size[2], 1e-9):
+                    orient_op.Set(Gf.Vec3f(90.0, 0.0, 0.0))
+                    print("[viz_env] db21: applied +90 deg X (Y-up correction)")
+                longest = max(size[0], size[1], size[2], 1e-9)
+                factor = 0.20 / longest
+                if not 0.5 < factor < 2.0:
+                    scale_op.Set(Gf.Vec3f(float(factor)))
+                    print(f"[viz_env] db21: scale {factor:.4g}")
+                for link in ("base_link", "left_wheel_link", "right_wheel_link", "caster_link"):
+                    visuals = stage.GetPrimAtPath(f"{robot}/{link}/visuals")
+                    if visuals and visuals.IsValid():
+                        UsdGeom.Imageable(visuals).MakeInvisible()
+                marker = stage.GetPrimAtPath(f"{robot}/base_link/marker_visual")
+                if marker and marker.IsValid():
+                    UsdGeom.Imageable(marker).MakeInvisible()
+                print("[viz_env] DB21 (duckiebot3) visual attached")
+                return
+
+        for link, stem, offset in _REAL_VISUALS:
+            xform = UsdGeom.Xform.Define(stage, f"{robot}/{link}/real_{stem}")
+            xform.AddTranslateOp().Set(Gf.Vec3d(*offset))
+            scale_op = xform.AddScaleOp()
+            scale_op.Set(Gf.Vec3f(1.0))
+            xform.GetPrim().GetReferences().AddReference(str(converted[stem]))
+            # OBJ carries no unit metadata, so the converter guesses; measure and normalise to
+            # the robot's known dimensions instead of trusting the guess.
+            bbox_cache.Clear()
+            size = bbox_cache.ComputeWorldBound(xform.GetPrim()).ComputeAlignedRange().GetSize()
+            longest = max(size[0], size[1], size[2], 1e-9)
+            factor = expected_m[stem] / longest
+            dims = f"{size[0]:.4f} x {size[1]:.4f} x {size[2]:.4f}"
+            print(f"[viz_env] {stem}: bbox {dims} m -> scale {factor:.4g}")
+            if not 0.5 < factor < 2.0:
+                scale_op.Set(Gf.Vec3f(float(factor)))
+            _bind_color(stage, xform.GetPrim(), _VISUAL_COLORS.get(stem, (0.08, 0.08, 0.09)))
+        for link in ("base_link", "left_wheel_link", "right_wheel_link", "caster_link"):
+            visuals = stage.GetPrimAtPath(f"{robot}/{link}/visuals")
+            if visuals and visuals.IsValid():
+                UsdGeom.Imageable(visuals).MakeInvisible()
+        # the yellow marker sphere lives outside visuals/ on some builds; hide it too if present
+        marker = stage.GetPrimAtPath(f"{robot}/base_link/marker_visual")
+        if marker and marker.IsValid():
+            UsdGeom.Imageable(marker).MakeInvisible()
+        _ = Sdf  # imported for side effect parity across Kit versions
+        print(f"[viz_env] real Duckiebot meshes attached from {mesh_dir}")
+    except Exception as exc:
+        print(f"[viz_env] real visuals unavailable, keeping primitives: {exc!r}")
+
+
 def make_viz_env(
     map: str = "loop_small",
     num_envs: int = 1,
@@ -321,6 +515,7 @@ def make_viz_env(
         )
     cfg = lane_follow_env_cfg(settings, **overrides)
     env = DuckiebotLaneFollowEnv(cfg, render_mode="rgb_array" if render else None)
+    _attach_real_visuals(env)
     adapter = IsaacVizEnv(env)
     adapter.requested_map = str(map)
     return adapter
