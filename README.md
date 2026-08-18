@@ -120,8 +120,15 @@ $ISAAC = "d:/Personal/personal/wheeled_quadruped_robot/.venv/Scripts/python.exe"
 & $ISAAC tools/import_urdf_headless.py                 # URDF -> assets/usd/duckiebot.usda
 & $ISAAC scripts/build_city.py --all --out assets/usd  # 64 training + 4 held-out layouts
 
-# Train.
+# Train. 64 layouts, one per environment, all feeding a single policy.
 & $ISAAC scripts/train.py --task Duckiebot-LaneFollow-v0 --num_envs 256 --headless --enable_cameras
+
+# Train WITH the Isaac window open, to watch all N robots drive while they learn. Drop
+# --headless and keep --enable_cameras (the policy is camera-driven; without it there is no
+# observation). The viewport costs both VRAM and system commit, so cut the environment count:
+# 64 is measured to fit alongside the GUI on an 8 GB card. One Kit process at a time.
+& $ISAAC scripts/train.py --task Duckiebot-LaneFollow-v0 --num_envs 64 --num-variants 64 `
+    --enable_cameras --resume latest
 
 # Export a trained policy for both Jetson targets, with preprocessing baked in.
 & $ISAAC scripts/export_policy.py --checkpoint checkpoints/best.pt --out-dir exports/
@@ -231,6 +238,57 @@ the learner.
 * **The credibility gate** is Pendulum-v1, not CartPole: it exercises the Gaussian head, the
   KL-adaptive learning rate and the bounds loss, which a discrete-action gate would leave
   completely untested. It runs in CI on every push.
+
+### Lane discipline: what the reward actually pays for
+
+One policy is trained across **64 city layouts at once**, one layout per parallel environment
+(`--num-variants 64`), so lane following is learned as a skill rather than as a memorised
+circuit. Each variant carries its own geometry bucket, tile pitch and clear lane width.
+
+The reward lives in `duckiebot_rl/envs/rewards.py`. Two of its terms exist specifically to make
+leaving the lane unprofitable, and they were added on 2026-08-18 after a measurement showed the
+original reward paying for the opposite:
+
+| offset from lane centreline | on drivable road? | old step reward | current step reward |
+| --- | --- | --- | --- |
+| 0.00 m (centred) | yes | **+7.00** | **+7.00** |
+| 0.05 m | yes | +4.27 | +4.27 |
+| 0.10 m (at the lane line) | yes | +4.25 | -2.59 |
+| 0.20 m (outside the lane) | yes, on curve tiles | +4.25 | -4.55 |
+| 0.25 m (well outside) | yes, on curve tiles | +4.25 | -5.53 |
+
+Measured on `city_000` (`w_ep` 0.2046 m) by sweeping the robot sideways and evaluating the
+reward at each offset. The old reward was **flat at +4.25 all the way out**: 61 % of the
+on-centre reward for being completely out of the lane, with no gradient anywhere to pull it
+back. Two independent holes caused it.
+
+* **`r_progress` gated on signed `d`**, which locks the yellow/oncoming side only and never
+  fires for the white/outer side. The reasoning was that the outer side is guarded by the
+  off-drivable termination; that holds on straights (on-road only to 0.98 half-lane widths) and
+  fails on curves, where the tile is wide enough to sit 2.44 half-lane widths out and stay on
+  the road. Curves are exactly where a lane follower drifts wide. The gate is now two-sided.
+* **`r_lateral` saturates at the lane edge.** It is `-(1 - 0.001 ** (|d| / (w/2)))`, which is
+  -0.999 at one half-lane width, so its slope collapses from -6.8e-02 /m there to -6.8e-08 /m
+  at three. Bounded is right, since an unbounded penalty would dominate the early flailing
+  phase, but it leaves the out-of-lane region numerically flat. **`r_lane_departure`** now adds
+  a linear penalty, one unit per half-lane width beyond the lane edge, capped at 3.0 which is
+  outside the reachable set rather than at the lane edge. It starts exactly where progress
+  stops paying, so there is no dead band between the two.
+
+A third defect was in the metric rather than the reward. The lane graph matches a pose to the
+**nearest** lane, so a robot that has fully crossed the yellow line is re-matched to the
+oncoming lane and its `|d|` collapses from 0.103 m back to 0.003 m. Since
+`episode/out_of_lane_integral_ms` is `clip(|d| - w/2, 0)` integrated, it stopped accumulating
+exactly when the robot was most thoroughly out of its lane. **`wrong_lane_indicator`** detects
+that case from `psi`, which the re-match cannot hide (the oncoming lane's tangent points the
+other way, so `|psi| > 90 deg`); the integral is charged at least a half-lane width while it
+fires, and `episode/wrong_lane_s` reports the time directly.
+
+Why this was not simply a matter of training longer: over iterations 0 to 281 of run
+`20260818T034543Z`, mean `out_of_lane_integral_ms` **rose** 0.058 -> 0.173 while the return
+rose -6.8 -> +1776. Return and lane discipline were anti-correlated, so more steps bought more
+lane-crossing. `RewardWeights.legacy()` reproduces the pre-fix reward for ablation, and
+`tests/unit/test_rewards.py` pins the hole so it cannot silently reopen.
 
 ### Domain randomization
 
