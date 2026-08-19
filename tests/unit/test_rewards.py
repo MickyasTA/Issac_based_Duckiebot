@@ -379,9 +379,10 @@ def test_total_reward_is_the_weighted_sum_of_the_terms():
         + weights.smooth * float(terms.smooth)
         + weights.proximity * float(terms.proximity)
         - weights.stall * float(terms.stall)
+        + weights.survival
     )
     assert float(reward) == pytest.approx(expected, abs=1e-5)
-    assert float(reward) == pytest.approx(1.0 * 1.0 + 6.0 * 1.0, abs=1e-4)
+    assert float(reward) == pytest.approx(1.0 * 1.0 + 6.0 * 1.0 + weights.survival, abs=1e-4)
 
 
 def test_terminal_penalty_is_added_before_the_clip():
@@ -448,12 +449,16 @@ def straight_lane() -> tuple[BatchedLaneGraph, int, float]:
     return lane, segment, float(lane.seg_length[0, segment])
 
 
+ROLLOUT_STEPS = 18
+"""Steps every ``_rollout`` takes; the shift-free tests need it to net out the survival income."""
+
+
 def _rollout(
     lane: BatchedLaneGraph,
     segment: int,
     length: float,
     mode: str,
-    steps: int = 18,
+    steps: int = ROLLOUT_STEPS,
     weights: rw.RewardWeights | None = None,
 ) -> float:
     """Roll one behaviour along a lane segment and return the total S5.4 reward.
@@ -537,24 +542,50 @@ def test_clean_lane_following_scores_best(straight_lane):
     assert clean > backward, f"driving backwards scored {backward} against clean {clean}"
 
 
-def test_spinning_in_place_scores_negative(straight_lane):
-    """Not merely worse than clean driving: a stationary spin must be actively punished."""
+def test_spinning_in_place_is_priced_far_below_driving(straight_lane):
+    """A stationary spin must be actively punished relative to the survival baseline.
+
+    Before the survival term this asserted ``spin < 0`` outright. The term shifts every live
+    step by the same constant (that is its whole design: dying must not out-pay a bad state),
+    so absolute negativity is no longer the invariant. The invariant is the shift-free one: net
+    of the survival income, a spin still pays the full penalty price, and it earns a small
+    fraction of clean driving at best. The spin guard termination bounds how long the income
+    can be farmed, which is what keeps "spin forever" out of the strategy space.
+    """
     lane, segment, length = straight_lane
-    assert _rollout(lane, segment, length, "spin") < 0.0
+    weights = rw.RewardWeights()
+    spin = _rollout(lane, segment, length, "spin")
+    clean = _rollout(lane, segment, length, "clean")
+    steps = ROLLOUT_STEPS
+    assert spin - weights.survival * steps < 0.0, "net of survival, spinning must cost"
+    assert spin < 0.35 * clean
 
 
 def test_driving_backwards_earns_no_progress_credit(straight_lane):
-    """Reversing along the lane collects zero progress and pays the heading penalty."""
+    """Reversing collects zero progress and, net of the survival income, pays its way."""
     lane, segment, length = straight_lane
-    assert _rollout(lane, segment, length, "backward") < 0.0
+    weights = rw.RewardWeights()
+    backward = _rollout(lane, segment, length, "backward")
+    clean = _rollout(lane, segment, length, "clean")
+    assert backward - weights.survival * ROLLOUT_STEPS < 0.0
+    assert backward < 0.35 * clean
 
 
 def test_hugging_the_oncoming_lane_earns_no_progress_credit(straight_lane):
-    """At d = 0.09 the robot is past the gate, so the 6.0-weighted term pays nothing."""
+    """At d = 0.09 the robot is past the gate, so the 6.0-weighted term pays nothing.
+
+    Net of the survival income (a constant both behaviours receive equally), hugging the
+    oncoming lane still runs at a loss while clean driving profits, which is the ordering that
+    starves the behaviour.
+    """
     lane, segment, length = straight_lane
+    weights = rw.RewardWeights()
     hug = _rollout(lane, segment, length, "hug")
     clean = _rollout(lane, segment, length, "clean")
-    assert hug < 0.25 * clean
+    income = weights.survival * ROLLOUT_STEPS
+    assert hug - income < 0.0
+    assert clean - income > 0.0
+    assert hug < 0.35 * clean
 
 
 def test_drifting_wide_over_the_white_edge_is_now_unprofitable(straight_lane):
@@ -585,7 +616,11 @@ def test_the_old_weights_paid_almost_full_price_for_driving_out_of_the_lane(stra
     legacy_clean = _rollout(lane, segment, length, "clean", weights=rw.RewardWeights.legacy())
     legacy_wide = _rollout(lane, segment, length, "wide", weights=rw.RewardWeights.legacy())
     fixed_wide = _rollout(lane, segment, length, "wide")
+    fixed_clean = _rollout(lane, segment, length, "clean")
+    survival_income = rw.RewardWeights().survival * ROLLOUT_STEPS
     assert legacy_wide > 0.0
     assert legacy_wide > 0.2 * legacy_clean
-    assert fixed_wide < 0.0
-    assert fixed_wide < legacy_wide
+    # net of the survival income the identical trajectory is strongly negative, and it stays a
+    # small fraction of clean driving, which is the ordering that starves the exploit
+    assert fixed_wide - survival_income < 0.0
+    assert fixed_wide < 0.3 * fixed_clean

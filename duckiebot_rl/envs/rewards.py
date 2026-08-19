@@ -120,6 +120,19 @@ class RewardWeights:
             on truncation, which is bootstrapped instead (S6.4).
         departure: Weight of :func:`r_lane_departure`, the lane-discipline fix (see below).
         wrong_lane: Weight SUBTRACTED while :func:`wrong_lane_indicator` fires.
+        survival: Constant ADDED on every live step, the fix for the suicide equilibrium the
+            continuity-constrained matcher exposed (2026-08-18). Under the free matcher an
+            untrained policy paid about -0.71 per step, because re-homing onto the nearest lane
+            forgave excursions; with honest ``d`` the same wandering costs -2.0 to -4.4 per
+            step, while dying costs -10 once. Terminating 400 steps early then SAVES roughly
+            800 reward, and the run learned exactly that: mean episode length fell from 72 to
+            44 steps, returns "improved" from -316 to -88 by dying sooner, and eval distance
+            pinned at 1.8 tiles for 900 iterations. Adding a constant to every live step does
+            not reorder living trajectories, so no driving preference changes; it only makes
+            death forfeit future reward instead of harvesting it. 5.0 exceeds the worst
+            SUSTAINED wandering cost that was measured (4.4), so every recoverable state is
+            worth surviving, while the momentary worst states (departure at its cap on the way
+            off the road) stay net negative, which is the correct residual pressure.
         two_sided_progress_gate: Gate :func:`r_progress` on ``|d|`` rather than on signed ``d``.
 
     The lane-discipline fix (2026-08-18) and how to undo it
@@ -155,6 +168,7 @@ class RewardWeights:
     terminal: float = -10.0
     departure: float = 2.0
     wrong_lane: float = 2.0
+    survival: float = 5.0
     two_sided_progress_gate: bool = True
 
     @classmethod
@@ -169,7 +183,7 @@ class RewardWeights:
             A weight set that scores identically to the reward used up to iteration 281 of
             ``20260818T034543Z_lanefollow_seed0_main_seed0``.
         """
-        return cls(departure=0.0, wrong_lane=0.0, two_sided_progress_gate=False)
+        return cls(departure=0.0, wrong_lane=0.0, two_sided_progress_gate=False, survival=0.0)
 
 
 @dataclass
@@ -599,6 +613,7 @@ def compute_reward(
         - weights.stall * stall
         + weights.departure * departure
         - weights.wrong_lane * wrong_lane
+        + weights.survival
     )
     terms = RewardTerms(
         heading=heading,
