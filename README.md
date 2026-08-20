@@ -290,6 +290,22 @@ rose -6.8 -> +1776. Return and lane discipline were anti-correlated, so more ste
 lane-crossing. `RewardWeights.legacy()` reproduces the pre-fix reward for ablation, and
 `tests/unit/test_rewards.py` pins the hole so it cannot silently reopen.
 
+The honest reward then exposed a **level** error in two directions. First (2026-08-18) the
+suicide equilibrium: wandering cost more per step than the one-off -10 of dying, so PPO learned
+to die early; a survival income on every live step fixed the level. Second (2026-08-19) that
+income, paid unconditionally, made **not driving** the best risk-free policy: parking earned
++5.18/step until the stall guard fired, and a 0.04 m/s creep earned +6.40/step forever because
+any single step at or above 0.03 m/s resets the 2 s stall counter, while out-of-gate full-speed
+driving earned +5.05. A full training run converged to exactly that (returns 233 -> 1656 while
+eval distance fell 1.62 -> 0.02 tiles), and the actor's conv encoder died of disuse along the
+way. The survival income is therefore **motion-gated** since 2026-08-20: scaled by
+`clamp(|v| / 0.3, 0, 1)`, which is bit-identical at driving speeds and starves stillness, giving
+the income ordering DRIVE (11-12/step) > CREEP (2.07) > PARK (0.5) > DIE (-10).
+`tests/unit/test_reward_economy.py` pins that ordering through the real stall guard; a
+"success" now also requires a mean forward lane speed of at least 10 % of the speed cap
+(`scripts/train.py`), and every image update logs `train/actor_encoder_live_frac` so a dead
+vision pathway alarms in one iteration instead of six hundred.
+
 ### Domain randomization
 
 Three layers, each wired where it belongs. Per-step photometric randomization runs in torch

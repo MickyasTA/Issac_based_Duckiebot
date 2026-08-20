@@ -26,7 +26,8 @@ of truth in :mod:`duckiebot_rl.assets.params`.
 Reward hacking this design is meant to make unprofitable
 --------------------------------------------------------
 
-Three degenerate policies the research flagged, and the term that prices each one:
+Four degenerate policies that reached (or nearly reached) a live run, and the term that prices
+each one:
 
 * **Spinning in place.** ``r_prog`` is gated on ``ds > 0`` and ``ds`` is the displacement
   projected on the lane tangent, so a stationary spin earns nothing from it; ``r_heading``
@@ -37,10 +38,20 @@ Three degenerate policies the research flagged, and the term that prices each on
   ``(w - W_R) / 2 + 0.02`` so that riding the oncoming lane pays nothing at all.
 * **Driving backwards.** ``ds < 0`` fails the same gate, so reversing along the lane collects no
   progress reward while still paying the heading penalty for a ~180 deg heading error.
+* **Parking or creeping.** The survival income is scaled by :func:`r_survival`, which is
+  ``clamp(|v| / survival_speed_ref, 0, 1)``, so a stationary robot collects almost none of it
+  and the stall indicator subtracts 0.5 on top, while a barely-above-stall creep collects a
+  sliver against full-speed driving's whole stream. This one is not hypothetical: with the
+  survival term UNGATED, the 2026-08-19 run measured parking at +5.18/step risk-free and a
+  0.04 m/s creep at +6.40/step forever (the creep resets the 2 s stall guard every step), while
+  out-of-gate full-speed driving paid +5.05/step. PPO found the inversion between iterations
+  600 and 700 and every env stopped driving within ~50 iterations.
 
-``tests/unit/test_rewards.py`` rolls each of those three policies out against a real lane graph
-and asserts it scores strictly worse than clean lane following, so the claims above are checked
-rather than merely written down.
+``tests/unit/test_rewards.py`` rolls the first three policies out against a real lane graph and
+asserts each scores strictly worse than clean lane following; ``tests/unit/test_reward_economy.py``
+pins the fourth with archetype rollouts through the REAL stall guard, asserting the full income
+ordering DRIVE > CREEP > PARK > DIE with margins. The claims above are checked rather than merely
+written down.
 """
 
 from __future__ import annotations
@@ -70,6 +81,7 @@ __all__ = [
     "r_progress",
     "r_proximity",
     "r_smooth",
+    "r_survival",
     "stall_indicator",
     "terminal_reward",
     "wrong_lane_indicator",
@@ -120,19 +132,39 @@ class RewardWeights:
             on truncation, which is bootstrapped instead (S6.4).
         departure: Weight of :func:`r_lane_departure`, the lane-discipline fix (see below).
         wrong_lane: Weight SUBTRACTED while :func:`wrong_lane_indicator` fires.
-        survival: Constant ADDED on every live step, the fix for the suicide equilibrium the
-            continuity-constrained matcher exposed (2026-08-18). Under the free matcher an
-            untrained policy paid about -0.71 per step, because re-homing onto the nearest lane
-            forgave excursions; with honest ``d`` the same wandering costs -2.0 to -4.4 per
-            step, while dying costs -10 once. Terminating 400 steps early then SAVES roughly
-            800 reward, and the run learned exactly that: mean episode length fell from 72 to
-            44 steps, returns "improved" from -316 to -88 by dying sooner, and eval distance
-            pinned at 1.8 tiles for 900 iterations. Adding a constant to every live step does
-            not reorder living trajectories, so no driving preference changes; it only makes
-            death forfeit future reward instead of harvesting it. 5.0 exceeds the worst
-            SUSTAINED wandering cost that was measured (4.4), so every recoverable state is
-            worth surviving, while the momentary worst states (departure at its cap on the way
-            off the road) stay net negative, which is the correct residual pressure.
+        survival: Income ADDED on every live step, scaled by the :func:`r_survival` motion gate,
+            the fix for the suicide equilibrium the continuity-constrained matcher exposed
+            (2026-08-18). Under the free matcher an untrained policy paid about -0.71 per step,
+            because re-homing onto the nearest lane forgave excursions; with honest ``d`` the
+            same wandering costs -2.0 to -4.4 per step, while dying costs -10 once. Terminating
+            400 steps early then SAVES roughly 800 reward, and the run learned exactly that:
+            mean episode length fell from 72 to 44 steps, returns "improved" from -316 to -88 by
+            dying sooner, and eval distance pinned at 1.8 tiles for 900 iterations. 5.0 exceeds
+            the worst SUSTAINED wandering cost that was measured (4.4), so every recoverable
+            state is worth surviving, while the momentary worst states (departure at its cap on
+            the way off the road) stay net negative, which is the correct residual pressure.
+
+            Why the term is motion-gated (2026-08-20). Paid as an unconditional constant, this
+            term created the next equilibrium: a risk-free annuity for not driving. Measured
+            through this very function on the 2026-08-19 run's parameters: PARK earned +5.18 per
+            step until the 2 s stall guard fired (episode +160.5, restartable forever), a
+            0.04 m/s CREEP earned +6.40 per step with NO termination ever (one step at or above
+            0.03 m/s resets the stall counter, so any epsilon above it is guard-proof), while
+            full-speed driving at ``d`` = 8 cm, outside the progress gate, earned +5.05. The
+            best risk-free policy in the MDP was creeping, the run converged to exactly that
+            between iterations 600 and 700 (reward/stall 0.0 to 1.0, returns 233 to 1656, eval
+            distance 1.62 to 0.02 tiles), and the actor's vision pathway died with nothing left
+            to see. Scaling the income by ``clamp(|v| / survival_speed_ref, 0, 1)`` repairs the
+            ordering with margins, measured at the archetypes: DRIVE 11.0-12.0/step at or above
+            0.3 m/s (bit-identical to the ungated economy there, so no driving preference is
+            reordered), CREEP 2.07/step, PARK 0.5/step, DIE -10 once. Even out-of-gate driving
+            (5.05) now beats creeping, so the dominance survives execution error.
+        survival_speed_ref: Body speed, in m/s, at which the survival income saturates to its
+            full weight; half of ``DUCKIEBOT.v_cmd_max_m_s``. Values at or below zero disable
+            the gate and reproduce the unconditional pre-2026-08-20 term for ablations (that is
+            the economy that trained the parked policy of
+            ``20260819T031011Z_lanefollow_seed0_survival_seed0``; see
+            ``tests/unit/test_reward_economy.py`` before reaching for it).
         two_sided_progress_gate: Gate :func:`r_progress` on ``|d|`` rather than on signed ``d``.
 
     The lane-discipline fix (2026-08-18) and how to undo it
@@ -169,6 +201,7 @@ class RewardWeights:
     departure: float = 2.0
     wrong_lane: float = 2.0
     survival: float = 5.0
+    survival_speed_ref: float = 0.3
     two_sided_progress_gate: bool = True
 
     @classmethod
@@ -188,7 +221,7 @@ class RewardWeights:
 
 @dataclass
 class RewardTerms:
-    """The six per-step terms plus the stall indicator, each ``(N,)`` and UNWEIGHTED.
+    """The per-step terms and indicators, each ``(N,)`` and UNWEIGHTED.
 
     Attributes:
         heading: :func:`r_heading`.
@@ -199,6 +232,9 @@ class RewardTerms:
         stall: :func:`stall_indicator`, 1.0 where the robot is stalled.
         departure: :func:`r_lane_departure`.
         wrong_lane: :func:`wrong_lane_indicator`, 1.0 where the robot is in the oncoming lane.
+        survival: :func:`r_survival`, the motion gate on the survival income in ``[0, 1]``.
+            Logged since 2026-08-20 because it is no longer a constant: its fleet mean is the
+            cheapest parking alarm there is (1.0 while driving, near 0 while the fleet idles).
         total: The weighted sum, before the terminal penalty and before the clip.
     """
 
@@ -210,6 +246,7 @@ class RewardTerms:
     stall: torch.Tensor
     departure: torch.Tensor
     wrong_lane: torch.Tensor
+    survival: torch.Tensor
     total: torch.Tensor
 
     def as_dict(self) -> dict[str, torch.Tensor]:
@@ -293,6 +330,7 @@ def r_progress(
     v_max: float = DUCKIEBOT.v_cmd_max_m_s,
     control_dt: float = DUCKIEBOT.control_dt_s,
     two_sided: bool = True,
+    gate_scale: float | torch.Tensor = 1.0,
 ) -> torch.Tensor:
     """Return the gated lane-frame progress reward (SPEC v2 S5.4).
 
@@ -330,11 +368,36 @@ def r_progress(
         v_max: Commanded speed cap in m/s.
         control_dt: Control period in seconds.
         two_sided: Gate on ``|d|``. False restores the pre-fix one-sided gate.
+        gate_scale: Multiplier on the gate width, a manual ablation knob (2026-08-19). Nothing
+            anneals it: the planned env-side curriculum was evaluated and NOT wired
+            (2026-08-20 decision, below). Both training and evaluation run at 1.0 by default.
+
+            Why the knob was added, with the measurement that motivated it: the spec gate is
+            ``(0.2046 - 0.13) / 2 + 0.02 = 0.057 m``. A fresh pixels policy wobbles outside a
+            5.7 cm band nearly always, so the one meaningful positive term (weight 6.0) almost
+            never pays and the visual task was thought to get no dense signal: after 1M honest
+            steps the run sat at lane_dev_rms 0.35 m flat, 100% off-drivable endings, eval
+            pinned near 1.8 tiles, which is "drive straight to the first curve and fall off".
+
+            Why no anneal was wired: the autopsy of the 2026-08-19 run showed the sparsity
+            diagnosis was incomplete. At gate_scale 1.0 that run's healthy phase still improved
+            eval distance from 0 to 1.62-1.9 tiles by iteration 500-600, so density at 1.0 was
+            sufficient to learn; what killed the run was the unconditional survival income
+            making not-driving the best risk-free policy (see :func:`r_survival`). With
+            survival motion-gated, a moving policy earns a dense speed-proportional stream even
+            with zero progress income, which is the early-training density the anneal was meant
+            to provide, minus a second moving part. The archetype economy in
+            ``tests/unit/test_reward_economy.py`` is pinned at gate_scale 1.0; an anneal would
+            silently re-weigh those margins mid-run. The knob stays for ablations; if it is
+            ever driven by a schedule, note that even at 3.0 (0.170 m) the opposing lane's
+            centreline at 0.234 m stays OUTSIDE the band, the continuity-constrained matcher
+            keeps ``d`` truthful, and the wrong-lane flag still fires, so the corner-cutting
+            exploit cannot return; evaluation must stay at 1.0.
 
     Returns:
         ``(N,)`` reward in ``[0, ~1]``.
     """
-    gate = clear_half_lane(lane_width, robot_width, like=ds)
+    gate = clear_half_lane(lane_width, robot_width, like=ds) * gate_scale
     offset = d.abs() if two_sided else d
     allowed = (ds > 0.0) & (offset < gate)
     return torch.where(allowed, ds / (v_max * control_dt), torch.zeros_like(ds))
@@ -519,6 +582,45 @@ def stall_indicator(body_speed: torch.Tensor, stall_speed: float = 0.03) -> torc
     return (body_speed.abs() < stall_speed).to(body_speed.dtype)
 
 
+def r_survival(body_speed: torch.Tensor, speed_ref: float = 0.3) -> torch.Tensor:
+    """Return the motion gate on the survival income: ``clamp(|v| / speed_ref, 0, 1)``.
+
+    The survival term exists so that death forfeits future reward instead of harvesting it
+    (2026-08-18). Paid unconditionally it overshot: a robot that simply did not drive kept the
+    income at zero risk, and the 2026-08-19 run cashed that in, converging to a sub-stall-guard
+    creep in ~50 iterations once one env found it (see :class:`RewardWeights.survival`). This
+    gate makes the income proportional to motion below ``speed_ref`` and exactly the old
+    constant at or above it, so:
+
+    * living trajectories at driving speed are scored bit-identically to the ungated term, and
+      no preference between driving styles moves;
+    * a parked robot earns ~0 survival and still pays the stall indicator, so the parking
+      annuity is gone;
+    * a creeping robot earns income linear in its speed, which measured at the archetypes puts
+      creeping (2.07/step at 0.04 m/s) far below even out-of-gate full-speed driving
+      (5.05/step);
+    * from a slow bad state, accelerating recovers income at ``survival / speed_ref`` per m/s
+      (16.7 with the default weights), so the escape gradient points toward moving, and the
+      anti-suicide property is carried by that gradient exactly as the adversarial-stack pin in
+      ``tests/unit/test_reward_economy.py`` demands.
+
+    The magnitude is used, like :func:`stall_indicator`, so reversing still counts as motion:
+    the progress gate already refuses to pay it, and a recoverable reversing state must not read
+    as worth abandoning.
+
+    Args:
+        body_speed: ``(N,)`` body-frame forward speed in m/s.
+        speed_ref: Speed at which the gate saturates at 1.0. At or below zero the gate is
+            disabled and the pre-2026-08-20 unconditional term is reproduced (ablations only).
+
+    Returns:
+        ``(N,)`` gate in ``[0, 1]``.
+    """
+    if speed_ref <= 0.0:
+        return torch.ones_like(body_speed)
+    return torch.clamp(body_speed.abs() / speed_ref, max=1.0)
+
+
 def terminal_reward(
     terminated: torch.Tensor,
     weights: RewardWeights = RewardWeights(),
@@ -556,6 +658,7 @@ def compute_reward(
     prev_gap: torch.Tensor | None = None,
     terminated: torch.Tensor | None = None,
     weights: RewardWeights = RewardWeights(),
+    progress_gate_scale: float | torch.Tensor = 1.0,
     robot_width: float = DUCKIEBOT.robot_width_m,
     v_max: float = DUCKIEBOT.v_cmd_max_m_s,
     control_dt: float = DUCKIEBOT.control_dt_s,
@@ -581,6 +684,9 @@ def compute_reward(
             obstacle-free map (equivalent to ``+inf``).
         prev_gap: ``(N,)`` the same quantity last step, or None.
         terminated: ``(N,)`` bool termination flag, or None to skip the terminal penalty.
+        progress_gate_scale: Ablation multiplier on the progress gate width; see
+            :func:`r_progress`. No schedule drives it; training and evaluation both run at the
+            default 1.0.
         weights: The S5.4 weight set.
         robot_width: Robot width in metres.
         v_max: Commanded speed cap in m/s.
@@ -593,7 +699,16 @@ def compute_reward(
         and ``terms`` holds the UNWEIGHTED per-step terms for the S6.8 diagnostics.
     """
     heading = r_heading(d, psi)
-    progress = r_progress(ds, d, lane_width, robot_width, v_max, control_dt, weights.two_sided_progress_gate)
+    progress = r_progress(
+        ds,
+        d,
+        lane_width,
+        robot_width,
+        v_max,
+        control_dt,
+        weights.two_sided_progress_gate,
+        gate_scale=progress_gate_scale,
+    )
     lateral = r_lateral(d, lane_width)
     smooth = r_smooth(action, prev_action)
     if gap is None or prev_gap is None:
@@ -603,6 +718,7 @@ def compute_reward(
     stall = stall_indicator(body_speed, stall_speed)
     departure = r_lane_departure(d, lane_width, robot_width)
     wrong_lane = wrong_lane_indicator(psi)
+    survival = r_survival(body_speed, weights.survival_speed_ref)
 
     total = (
         weights.heading * heading
@@ -613,7 +729,7 @@ def compute_reward(
         - weights.stall * stall
         + weights.departure * departure
         - weights.wrong_lane * wrong_lane
-        + weights.survival
+        + weights.survival * survival
     )
     terms = RewardTerms(
         heading=heading,
@@ -624,6 +740,7 @@ def compute_reward(
         stall=stall,
         departure=departure,
         wrong_lane=wrong_lane,
+        survival=survival,
         total=total,
     )
     reward = total if terminated is None else total + terminal_reward(terminated, weights)

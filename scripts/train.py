@@ -100,12 +100,26 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from duckiebot_rl.assets.params import DUCKIEBOT  # noqa: E402
 from duckiebot_rl.envs.viz_env import ROBOT_MESH_CHOICES, TRAIN_ROBOT_MESH  # noqa: E402
 from duckiebot_rl.viz.metrics_logger import EpisodeRecord  # noqa: E402
 from duckiebot_rl.viz.run_dir import DEFAULT_RESULTS_ROOT, RunDir, find_latest_run  # noqa: E402
 
 _TERMINATION_CONDITIONS = ("off_drivable", "obstacle", "rollover", "stall", "spin")
 """The five S5.5 terminating conditions, in the order :class:`TerminationFlags` declares them."""
+
+SUCCESS_MIN_LANE_SPEED_M_S = 0.1 * DUCKIEBOT.v_cmd_max_m_s
+"""Mean forward lane speed below which a horizon episode is NOT a success (0.06 m/s).
+
+Success used to be the truncation flag alone, and the 2026-08-19 collapse showed why that is a
+lie: a fleet that parked at spawn (mean lane speed 0.006-0.02 m/s per truncated episode)
+reported 57% "success" while covering 0.2-0.8 tiles in 30 simulated seconds, and the dashboards
+looked like learning. Reaching the horizon is necessary but not sufficient; a success must also
+have MOVED. One tenth of the commanded speed cap separates the observed degenerate band
+(<= 0.02 m/s) from the slowest honest lane following ever measured in a healthy phase
+(~0.076 m/s at iteration 600) with margin on both sides, while a full-horizon episode at the
+floor still covers ~1.8 m, three tiles. ``eval/distance_tiles`` remains the model-selection
+metric; this floor only stops the training-side success curve from calling parking progress."""
 
 _FLAT_STAT_KEYS = frozenset(
     {
@@ -552,6 +566,16 @@ class EpisodeTracker:
     has already respawned the finished envs by the time it returns and their terminal ``d`` is
     gone. One step of a 450-step episode is not worth reaching into environment internals for.
 
+    Success requires MOTION, not just the horizon (2026-08-20). ``success`` used to be the
+    truncation flag verbatim, and the parked fleet of
+    ``20260819T031011Z_lanefollow_seed0_survival_seed0`` scored 57% "success" at a mean lane
+    speed of 0.006-0.02 m/s. When ``lane_speed_index`` is given (the last privileged entry,
+    ``body_speed * cos(psi)``, S5.2), the tracker accumulates the forward part of that signal
+    and an episode is a success only if it reached the horizon AND averaged at least
+    ``min_mean_lane_speed``. ``termination_reason`` still reports ``"truncated"`` for every
+    horizon episode, so the CSV keeps the full picture: a slow truncation reads as
+    ``truncated`` + ``success=False``, which is exactly what it is.
+
     One episode per environment is deliberately **not** written. ``_reset_idx`` staggers
     ``episode_length_buf`` with a random start so the horizon truncations do not all land on the
     same iteration, which means the episode in flight when the tracker starts began before the
@@ -563,9 +587,22 @@ class EpisodeTracker:
         num_envs: Parallel environment count.
         step_dt: Control period in seconds, which turns a step count into a duration.
         d_index: Index of ``d`` inside ``vec_priv``.
+        lane_speed_index: Index of the lane-frame forward speed inside ``vec_priv``, or None to
+            keep the legacy horizon-only success.
+        min_mean_lane_speed: Mean forward lane speed, m/s, a horizon episode must have averaged
+            to count as a success. Ignored while ``lane_speed_index`` is None.
     """
 
-    def __init__(self, num_envs: int, device: Any, step_dt: float, d_index: int, horizon: int = 32) -> None:
+    def __init__(
+        self,
+        num_envs: int,
+        device: Any,
+        step_dt: float,
+        d_index: int,
+        horizon: int = 32,
+        lane_speed_index: int | None = None,
+        min_mean_lane_speed: float = 0.0,
+    ) -> None:
         """Allocate the per-env accumulators and the per-rollout staging planes.
 
         Args:
@@ -575,18 +612,26 @@ class EpisodeTracker:
             d_index: Index of ``d`` inside ``vec_priv``, that is ``spaces.vec_dim``.
             horizon: Expected number of :meth:`update` calls between drains, that is the rollout
                 length ``T``. The planes double if a caller exceeds it, so this is only a hint.
+            lane_speed_index: Index of the lane-frame forward speed inside ``vec_priv``, that is
+                ``spaces.priv_dim - 1`` (S5.2 puts ``body_speed * cos(psi)`` last). None keeps
+                the legacy success semantics: reached the horizon, moving or not.
+            min_mean_lane_speed: The motion floor for success, in m/s; see
+                :data:`SUCCESS_MIN_LANE_SPEED_M_S` for the production value and its sizing.
         """
         import torch
 
         self.num_envs = int(num_envs)
         self.step_dt = float(step_dt)
         self.d_index = int(d_index)
+        self.lane_speed_index = None if lane_speed_index is None else int(lane_speed_index)
+        self.min_mean_lane_speed = float(min_mean_lane_speed)
         self._torch = torch
         self._device = device
         self._return = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
         self._steps = torch.zeros(self.num_envs, dtype=torch.long, device=device)
         self._d_sq = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
         self._d_max = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
+        self._speed_sum = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
         self._partial = torch.ones(self.num_envs, dtype=torch.bool, device=device)
         self._dropped = torch.zeros((), dtype=torch.long, device=device)
         self._cursor = 0
@@ -608,13 +653,14 @@ class EpisodeTracker:
         self._p_steps = torch.zeros(*shape, dtype=torch.long, device=self._device)
         self._p_d_sq = torch.zeros(*shape, dtype=torch.float32, device=self._device)
         self._p_d_max = torch.zeros(*shape, dtype=torch.float32, device=self._device)
-        self._p_success = torch.zeros(*shape, dtype=torch.bool, device=self._device)
+        self._p_speed_sum = torch.zeros(*shape, dtype=torch.float32, device=self._device)
+        self._p_truncated = torch.zeros(*shape, dtype=torch.bool, device=self._device)
 
     def _planes(self) -> tuple[Any, ...]:
         """Return the staging planes in a fixed order.
 
         Returns:
-            The six ``(T, N)`` staging tensors.
+            The seven ``(T, N)`` staging tensors.
         """
         return (
             self._p_finished,
@@ -622,7 +668,8 @@ class EpisodeTracker:
             self._p_steps,
             self._p_d_sq,
             self._p_d_max,
-            self._p_success,
+            self._p_speed_sum,
+            self._p_truncated,
         )
 
     def _grow(self) -> None:
@@ -656,6 +703,7 @@ class EpisodeTracker:
         self._steps.zero_()
         self._d_sq.zero_()
         self._d_max.zero_()
+        self._speed_sum.zero_()
         self._partial.fill_(True)
         self._cursor = 0
         self._context.clear()
@@ -688,6 +736,11 @@ class EpisodeTracker:
         self._steps += 1
         self._d_sq += deviation * deviation
         self._torch.maximum(self._d_max, deviation, out=self._d_max)
+        if self.lane_speed_index is not None:
+            # Forward lane speed only, like the env's own `_ep_distance += clamp(ds, min=0)`:
+            # reversing must not buy motion credit toward the success floor.
+            lane_speed = vec_priv[:, self.lane_speed_index].detach().to(self._speed_sum.dtype)
+            self._speed_sum += self._torch.clamp(lane_speed, min=0.0)
 
         done = terminated | truncated
         # An episode counts only if the tracker watched it from step one.
@@ -701,7 +754,8 @@ class EpisodeTracker:
         self._p_steps[step] = self._steps
         self._p_d_sq[step] = self._d_sq
         self._p_d_max[step] = self._d_max
-        self._p_success[step] = truncated
+        self._p_speed_sum[step] = self._speed_sum
+        self._p_truncated[step] = truncated
         self._context.append((int(global_step), time.time(), reason))
         self._cursor = step + 1
 
@@ -712,6 +766,7 @@ class EpisodeTracker:
         self._steps.masked_fill_(done, 0)
         self._d_sq.masked_fill_(done, 0.0)
         self._d_max.masked_fill_(done, 0.0)
+        self._speed_sum.masked_fill_(done, 0.0)
 
     def drain(self) -> list[EpisodeRecord]:
         """Return every episode that finished since the last drain and rewind the staging planes.
@@ -736,16 +791,18 @@ class EpisodeTracker:
                 lengths,
                 self._torch.sqrt(self._p_d_sq[step_index, env_index] / lengths.clamp(min=1.0)),
                 self._p_d_max[step_index, env_index],
-                self._p_success[step_index, env_index].to(self._p_return.dtype),
+                self._p_speed_sum[step_index, env_index] / lengths.clamp(min=1.0),
+                self._p_truncated[step_index, env_index].to(self._p_return.dtype),
             ),
             dim=1,
         ).tolist()
         staged_at = step_index.tolist()
 
         records: list[EpisodeRecord] = []
-        for (score, length, rms, peak, success), where in zip(payload, staged_at, strict=True):
+        for (score, length, rms, peak, mean_speed, truncated), where in zip(payload, staged_at, strict=True):
             global_step, stamp, reason = context[where]
-            reached_horizon = success > 0.5
+            reached_horizon = truncated > 0.5
+            moved = self.lane_speed_index is None or mean_speed >= self.min_mean_lane_speed
             records.append(
                 EpisodeRecord(
                     score=float(score),
@@ -755,7 +812,7 @@ class EpisodeTracker:
                     timestamp=stamp,
                     lane_dev_rms=float(rms),
                     lane_dev_max=float(peak),
-                    success=reached_horizon,
+                    success=reached_horizon and moved,
                     termination_reason="truncated" if reached_horizon else reason,
                 )
             )
@@ -1132,6 +1189,10 @@ def train(
         env.step_dt,
         settings.spaces.vec_dim,
         horizon=buffer.num_steps,
+        # S5.2 puts the lane-frame forward speed (body_speed * cos(psi)) last in vec_priv; the
+        # motion floor keeps a parked fleet from reporting horizon truncations as successes.
+        lane_speed_index=settings.spaces.priv_dim - 1,
+        min_mean_lane_speed=SUCCESS_MIN_LANE_SPEED_M_S,
     )
     steps_per_iteration = buffer.num_steps * env.num_envs
     opening = (

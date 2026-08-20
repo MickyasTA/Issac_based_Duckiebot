@@ -79,8 +79,13 @@ class EpisodeRecord:
         timestamp: POSIX time it was recorded.
         lane_dev_rms: RMS lateral deviation from the lane centre, in metres.
         lane_dev_max: Peak lateral deviation, in metres.
-        success: Whether the episode reached its horizon without a terminating failure.
-        termination_reason: Why it ended, for example ``off_lane`` or ``truncated``.
+        success: Whether the episode reached its horizon without a terminating failure AND,
+            since 2026-08-20, actually moved: the training tracker also requires a mean forward
+            lane speed floor (``scripts/train.py``, ``SUCCESS_MIN_LANE_SPEED_M_S``). The old
+            horizon-only definition let the parked fleet of 2026-08-19 report 57% success at
+            0.006-0.02 m/s. Rows written before the change keep their recorded values.
+        termination_reason: Why it ended, for example ``off_lane`` or ``truncated``. Horizon
+            episodes report ``truncated`` whether or not they met the success floor.
     """
 
     score: float = 0.0

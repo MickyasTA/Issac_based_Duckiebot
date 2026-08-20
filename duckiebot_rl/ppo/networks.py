@@ -537,6 +537,53 @@ def build_actor(
     return ActorMean(agent).eval()
 
 
+@torch.no_grad()
+def encoder_liveness(
+    encoder: ImpoolaEncoder,
+    images: torch.Tensor,
+    sample: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(live_frac, out_std)``: is this encoder's output alive and image-dependent?
+
+    Why this exists: the actor encoder of run ``20260819T031011Z_lanefollow_seed0_survival_seed0``
+    died silently between iterations 600 and 700. Its trunk pre-ReLU activations went all-negative
+    (|mean| ~1.7e4), so ``relu(trunk)`` was exactly zero at every position, the pooled vector was
+    zero, ``relu(fc(0))`` was zero for all 256 units, and from then on the policy returned
+    bit-identical actions for real, blank and random images. That state is a one-way cliff: with
+    every ReLU shut, the image gradient is exactly zero forever, and nothing in the training
+    diagnostics showed it. This probe makes the cliff visible in the iteration it happens.
+
+    Two scalars, both computed on the device so the caller can fold them into an existing host
+    transfer (SPEC v2 S6.7 guard 5):
+
+    * ``live_frac``: fraction of output units that are strictly positive for at least one sampled
+      frame. The dead-zero pathway reads exactly 0.0; a healthy fresh encoder reads well above 0.
+    * ``out_std``: mean over units of the across-sample standard deviation of the output. This
+      catches the subtler failure the first scalar cannot: a constant nonzero output, which is
+      just as blind (the observed signature was "same action for any image"). Reads 0.0 whenever
+      the output does not depend on the input.
+
+    Alarm rule for dashboards and babysitting: either scalar at 0.0 on an image run means the
+    vision pathway is dead or blind, and the run is burning GPU-hours on a vec-only policy.
+
+    Args:
+        encoder: The encoder to probe (in practice the ACTOR's; the critic's was still alive in
+            the postmortem and would have masked the failure).
+        images: ``(B, H, W, C)`` NHWC uint8 or float batch, e.g. the rollout buffer's flattened
+            frames. A strided sample is probed so the cost stays one small forward pass.
+        sample: Maximum frames to probe; the batch is strided to spread the sample across it.
+
+    Returns:
+        ``(live_frac, out_std)``, each a 0-dim tensor on the encoder's device.
+    """
+    stride = max(1, int(images.shape[0]) // max(1, int(sample)))
+    features = encoder(images[::stride][: max(1, int(sample))])
+    live_frac = (features > 0.0).any(dim=0).float().mean()
+    # Population std: defined (0.0) even for a single-frame probe, where the unbiased form is NaN.
+    out_std = features.std(dim=0, correction=0).mean()
+    return live_frac, out_std
+
+
 def count_parameters(module: nn.Module, trainable_only: bool = True) -> int:
     """Count parameters in a module.
 

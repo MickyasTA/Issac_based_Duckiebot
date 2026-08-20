@@ -16,6 +16,7 @@ from duckiebot_rl.ppo.networks import (
     ResidualBlock,
     build_actor,
     count_parameters,
+    encoder_liveness,
     parameter_report,
 )
 
@@ -263,3 +264,56 @@ def test_network_config_validation() -> None:
         NetworkConfig(obs_height=47)
     with pytest.raises(ValueError, match="priv_dim"):
         NetworkConfig(vec_dim=14, priv_dim=8)
+
+
+# =============================================================================================
+# Encoder liveness: the probe that would have caught the 2026-08-19 dead actor at iteration ~650
+# =============================================================================================
+
+
+def test_encoder_liveness_reads_alive_on_a_fresh_encoder() -> None:
+    """A healthy orthogonally-initialised encoder is nonzero and image-dependent."""
+    torch.manual_seed(41)
+    encoder = ImpoolaEncoder(in_channels=9).eval()
+    image, _, _ = _obs(8)
+    live_frac, out_std = encoder_liveness(encoder, image)
+    assert float(live_frac) > 0.1, "a fresh encoder must have live output units"
+    assert float(out_std) > 0.0, "a fresh encoder's output must depend on the image"
+
+
+def test_encoder_liveness_reads_dead_zero_on_the_postmortem_signature() -> None:
+    """The observed death: every output unit's pre-activation negative for EVERY input.
+
+    Reproduced surgically at the fc stage (zero weights, negative bias), which is where the
+    observed cliff terminates: ``relu(fc(pooled))`` identically zero, no image gradient, ever.
+    Both probe scalars must read exactly 0.0, because this state is unrecoverable and the whole
+    point of the probe is that 0.0 here is an alarm, not a curve to watch.
+    """
+    torch.manual_seed(43)
+    encoder = ImpoolaEncoder(in_channels=9).eval()
+    with torch.no_grad():
+        encoder.fc.weight.zero_()
+        encoder.fc.bias.fill_(-1.0)
+    image, _, _ = _obs(8)
+    live_frac, out_std = encoder_liveness(encoder, image)
+    assert float(live_frac) == 0.0
+    assert float(out_std) == 0.0
+
+
+def test_encoder_liveness_flags_a_constant_nonzero_output_as_blind() -> None:
+    """The subtler blindness: alive units that ignore the image entirely.
+
+    The postmortem's behavioural signature was bit-identical actions for real, blank and random
+    frames. A constant positive output would pass the live-units check, so the second scalar
+    exists: across-sample standard deviation exactly 0.0 says the pathway carries no
+    information, whatever its level.
+    """
+    torch.manual_seed(47)
+    encoder = ImpoolaEncoder(in_channels=9).eval()
+    with torch.no_grad():
+        encoder.fc.weight.zero_()
+        encoder.fc.bias.fill_(1.0)
+    image, _, _ = _obs(8)
+    live_frac, out_std = encoder_liveness(encoder, image)
+    assert float(live_frac) == 1.0
+    assert float(out_std) == 0.0

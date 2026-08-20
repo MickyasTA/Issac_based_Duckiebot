@@ -654,6 +654,10 @@ def test_update_reports_exactly_the_declared_keys_and_the_documented_tail() -> N
         "advantage_std",
         "value_target_mean",
         "learning_rate",
+        # Image runs also carry the actor-vision liveness probe (2026-08-20): the 2026-08-19
+        # dead-encoder collapse was invisible for 600 iterations because nothing reported it.
+        "actor_encoder_live_frac",
+        "actor_encoder_out_std",
     }
     assert set(stats) == set(UPDATE_STAT_KEYS) | tail
     assert learner.num_updates == 1
@@ -950,6 +954,43 @@ def test_episode_tracker_matches_the_per_step_implementation(train_module: Any, 
         assert got.lane_dev_max == pytest.approx(want.lane_dev_max)
         assert got.success == want.success
         assert got.termination_reason == want.termination_reason
+
+
+def test_episode_tracker_success_requires_the_motion_floor(train_module: Any) -> None:
+    """Reaching the horizon no longer suffices: a parked or reversing truncation is not a success.
+
+    The 2026-08-19 collapse reported 57% "success" from a fleet whose truncated episodes
+    averaged 0.006-0.02 m/s of forward lane speed. With ``lane_speed_index`` wired, success
+    demands the horizon AND a mean forward lane speed at or above the floor; the forward clamp
+    means reversing buys no motion credit. ``termination_reason`` keeps saying ``truncated``
+    for every horizon episode, so the CSV still separates "slow truncation" from "crash".
+    """
+    envs, priv_dim, lane_idx, floor = 4, 8, 7, 0.06
+    tracker = train_module.EpisodeTracker(
+        envs, "cpu", 1.0 / 15.0, 4, horizon=8, lane_speed_index=lane_idx, min_mean_lane_speed=floor
+    )
+
+    def step(speeds: list[float], terminated: list[bool], truncated: list[bool], reason: str) -> None:
+        priv = torch.zeros(envs, priv_dim)
+        priv[:, lane_idx] = torch.tensor(speeds)
+        tracker.update(priv, torch.ones(envs), torch.tensor(terminated), torch.tensor(truncated), 0, reason)
+
+    # First episodes are partial by construction and dropped; finish them everywhere.
+    step([0.5, 0.5, 0.5, 0.5], [False] * envs, [True] * envs, "truncated")
+    # Second episodes: env0 drives, env1 creeps, env2 reverses at speed, env3 drives but crashes.
+    for _ in range(3):
+        step([0.5, 0.02, -0.5, 0.5], [False] * envs, [False] * envs, "off_drivable")
+    step([0.5, 0.02, -0.5, 0.5], [False, False, False, True], [True, True, True, False], "off_drivable")
+    records = tracker.drain()
+
+    assert [record.success for record in records] == [True, False, False, False]
+    assert [record.termination_reason for record in records] == [
+        "truncated",
+        "truncated",
+        "truncated",
+        "off_drivable",
+    ]
+    assert all(record.steps == 4 for record in records)
 
 
 def test_episode_tracker_update_never_synchronises_with_the_host(train_module: Any) -> None:

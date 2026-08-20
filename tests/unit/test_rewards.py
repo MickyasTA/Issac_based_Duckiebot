@@ -379,7 +379,7 @@ def test_total_reward_is_the_weighted_sum_of_the_terms():
         + weights.smooth * float(terms.smooth)
         + weights.proximity * float(terms.proximity)
         - weights.stall * float(terms.stall)
-        + weights.survival
+        + weights.survival * float(terms.survival)
     )
     assert float(reward) == pytest.approx(expected, abs=1e-5)
     assert float(reward) == pytest.approx(1.0 * 1.0 + 6.0 * 1.0 + weights.survival, abs=1e-4)
@@ -406,9 +406,16 @@ def test_reward_is_clipped_to_the_spec_range():
 
 
 def test_reward_terms_are_reported_unweighted_for_logging():
-    """S6.8 logs per-term means; they must be the raw terms, not pre-multiplied."""
+    """S6.8 logs per-term means; they must be the raw terms, not pre-multiplied.
+
+    ``survival`` joined the reported set on 2026-08-20, when the term stopped being a constant:
+    the :func:`~duckiebot_rl.envs.rewards.r_survival` motion gate makes its fleet mean a live
+    diagnostic (1.0 while the fleet drives, near 0 while it idles), which is exactly the curve
+    that would have shown the 2026-08-19 parking collapse at iteration ~640 instead of ~1200.
+    """
     _reward, terms = rw.compute_reward(**_nominal_kwargs())
     assert float(terms.progress) == pytest.approx(1.0, abs=1e-4)
+    assert float(terms.survival) == pytest.approx(1.0, abs=1e-6)  # nominal speed is v_max
     assert set(terms.as_dict()) == {
         "heading",
         "progress",
@@ -418,6 +425,7 @@ def test_reward_terms_are_reported_unweighted_for_logging():
         "stall",
         "departure",
         "wrong_lane",
+        "survival",
         "total",
     }
 

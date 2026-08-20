@@ -42,7 +42,7 @@ from duckiebot_rl.ppo.buffer import RolloutBuffer
 from duckiebot_rl.ppo.config import PPOConfig, ratio_assert_atol, strict_fp32_enabled
 from duckiebot_rl.ppo.distributions import approx_kl_k3, diag_gaussian_kl
 from duckiebot_rl.ppo.gae import compute_gae
-from duckiebot_rl.ppo.networks import ActorCritic
+from duckiebot_rl.ppo.networks import ActorCritic, encoder_liveness
 from duckiebot_rl.ppo.running_norm import RunningMeanStd
 
 #: The diagnostics :meth:`PPO.update` accumulates per gradient step, in sorted order. A module
@@ -339,6 +339,10 @@ class PPO:
             ``bounds_loss``, ``approx_kl`` (k3), ``analytic_kl``, ``clipfrac``, ``ratio_mean``,
             ``grad_norm`` (pre-clip), ``mean_sigma``, ``mean_abs_mu``, ``explained_variance``,
             ``learning_rate``, ``advantage_mean``, ``advantage_std``, ``value_target_mean``.
+            Image runs additionally report ``actor_encoder_live_frac`` and
+            ``actor_encoder_out_std``, the :func:`~duckiebot_rl.ppo.networks.encoder_liveness`
+            probe of the actor's vision pathway; either at 0.0 means the actor has gone blind
+            (the silent failure of 2026-08-19) and the run needs intervention, not patience.
 
         Raises:
             RatioAssertionError: If the epoch-0 minibatch-0 importance ratio is not 1 within the
@@ -464,7 +468,15 @@ class PPO:
                 1.0 - (returns_real - values_real).var() / (var_returns + 1e-8),
                 torch.zeros_like(var_returns),
             )
-            tail = torch.stack([explained, adv_mean, adv_std, returns_real.mean()])
+            tail_values = [explained, adv_mean, adv_std, returns_real.mean()]
+            # The actor's vision pathway is probed once per update, on the device, and its two
+            # scalars ride the same closing transfer: the 2026-08-19 dead-encoder collapse was
+            # invisible for 600 iterations precisely because nothing reported this.
+            probe_vision = images is not None and self.agent.actor.encoder is not None
+            if probe_vision:
+                live_frac, out_std = encoder_liveness(self.agent.actor.encoder, images)
+                tail_values += [live_frac, out_std]
+            tail = torch.stack(tail_values)
             # One host synchronisation for every diagnostic in the update.
             merged = torch.cat([means, tail]).cpu().tolist()
 
@@ -473,6 +485,9 @@ class PPO:
         out_stats["advantage_mean"] = merged[len(keys) + 1]
         out_stats["advantage_std"] = merged[len(keys) + 2]
         out_stats["value_target_mean"] = merged[len(keys) + 3]
+        if probe_vision:
+            out_stats["actor_encoder_live_frac"] = merged[len(keys) + 4]
+            out_stats["actor_encoder_out_std"] = merged[len(keys) + 5]
 
         if self.cfg.kl_adaptive and not self.cfg.kl_adapt_per_minibatch:
             self._adapt_learning_rate(out_stats["analytic_kl"])
