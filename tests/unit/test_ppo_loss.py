@@ -248,15 +248,24 @@ def test_kl_controller_lowers_the_learning_rate_above_the_upper_target() -> None
 
 
 def test_kl_controller_raises_the_learning_rate_below_the_lower_target() -> None:
-    """A KL below 0.005 multiplies the learning rate by 1.5, clamped at 1e-2."""
+    """A KL below 0.005 multiplies the learning rate by 1.5, clamped at lr_max = 1e-3.
+
+    The ceiling is part of the property. The controller raises lr while KL is LOW, and a dying
+    vision encoder keeps KL low (the policy barely changes when it cannot see), so a generous
+    ceiling turns encoder trouble into a self-reinforcing death spiral: lr climbs, Adam's
+    per-parameter step grows with lr no matter what the clipped gradient norm is, the encoder
+    dies harder, KL falls further. Measured killing the actor's conv trunk twice (iteration
+    ~600 of one run, iteration 12 of a fresh one) before the cap was lowered from 1e-2.
+    """
     cfg = _config()
     learner = _learner(cfg)
-    learner.set_learning_rate(1e-3)
+    learner.set_learning_rate(3e-4)
     learner._adapt_learning_rate(0.001)
-    assert learner.learning_rate == pytest.approx(1e-3 * 1.5)
+    assert learner.learning_rate == pytest.approx(3e-4 * 1.5)
     for _ in range(50):
         learner._adapt_learning_rate(0.001)
     assert learner.learning_rate == pytest.approx(cfg.lr_max)
+    assert cfg.lr_max == pytest.approx(1e-3)
 
 
 def test_kl_controller_holds_inside_the_dead_band_and_ignores_nan() -> None:
@@ -348,7 +357,7 @@ def test_default_config_matches_the_spec_table() -> None:
     assert cfg.max_grad_norm == 1.0
     assert (cfg.learning_rate, cfg.adam_eps) == (3e-4, 1e-5)
     assert (cfg.kl_target_lower, cfg.kl_target_upper, cfg.lr_factor) == (0.005, 0.02, 1.5)
-    assert (cfg.lr_min, cfg.lr_max) == (1e-5, 1e-2)
+    assert (cfg.lr_min, cfg.lr_max) == (1e-5, 1e-3)  # lr_max lowered 2026-08-21, see PPOConfig
     assert cfg.network.sigma_init == 0.5
     assert (cfg.network.log_std_min, cfg.network.log_std_max) == (-5.0, 2.0)
     assert cfg.network.obs_shape == (48, 96, 9)

@@ -41,6 +41,21 @@ from duckiebot_rl.ppo.distributions import DiagGaussianHead, GaussianOutput, ort
 
 layer_init = orthogonal_init_
 
+LEAKY_SLOPE = 0.01
+"""Negative slope of every encoder activation (2026-08-21, the second dead-encoder incident).
+
+Plain ReLU gave the actor's conv trunk a one-way death: once a KL-starved learning-rate spiral
+(the adaptive controller raises lr toward lr_max whenever KL is low, and a dying encoder makes
+KL low) pushed every pre-activation negative, output and gradient were exactly zero forever.
+Measured twice: at iteration ~600 of the survival run and at iteration 12 of a fresh run, with
+pre-ReLU magnitudes around 1.7e4. A leaky slope keeps a gradient alive at any excursion, so the
+same event becomes a recoverable dip instead of brain death. 0.01 is the standard slope; at
+healthy activations the network is numerically indistinguishable from ReLU. The paired fix caps
+``PPOConfig.lr_max`` at 1e-3, closing the spiral's throttle. Archived checkpoints predate this
+and were all either healthy-ReLU (compatible in practice: healthy activations rarely cross
+zero) or dead (worthless); the S6.2 activation note in the spec is amended by this constant.
+"""
+
 
 class ResidualBlock(nn.Module):
     """Pre-activation residual block: ``ReLU -> Conv3x3 -> ReLU -> Conv3x3 -> +skip``.
@@ -54,7 +69,7 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.conv0 = layer_init(nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1), gain)
         self.conv1 = layer_init(nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1), gain)
-        self.relu = nn.ReLU(inplace=False)
+        self.relu = nn.LeakyReLU(LEAKY_SLOPE, inplace=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the block.
@@ -125,7 +140,7 @@ class ImpoolaEncoder(nn.Module):
             stages.append(ConvSequence(current, channel, gain))
             current = channel
         self.stages = nn.Sequential(*stages)
-        self.relu = nn.ReLU(inplace=False)
+        self.relu = nn.LeakyReLU(LEAKY_SLOPE, inplace=False)
         self.fc = layer_init(nn.Linear(current, out_dim), gain)
         self.out_dim = out_dim
         self.in_channels = in_channels

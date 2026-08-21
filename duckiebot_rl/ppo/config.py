@@ -158,7 +158,13 @@ class PPOConfig:
         kl_target_lower: Below this analytic KL the learning rate is multiplied by ``lr_factor``.
         lr_factor: Multiplicative step of the controller.
         lr_min: Lower bound on the learning rate.
-        lr_max: Upper bound on the learning rate.
+        lr_max: Upper bound on the learning rate. 1e-3, an order below its original value:
+            the KL-adaptive controller RAISES lr while KL is under target, and a dying encoder
+            keeps KL small, so a high ceiling turns encoder trouble into a death spiral (lr
+            climbs toward the ceiling, Adam's per-parameter step grows with lr regardless of
+            the clipped gradient norm, the encoder dies harder, KL falls further). Measured
+            killing the actor's vision twice before the cap; PPO with Adam essentially never
+            profits from lr above 1e-3 anyway.
         kl_adapt_per_minibatch: If True the controller fires once per minibatch (rsl_rl / Isaac
             ecosystem behaviour); if False it fires once per update from the batch-mean KL.
         norm_adv: Normalise advantages once at batch level (never also per minibatch).
@@ -221,7 +227,7 @@ class PPOConfig:
     kl_target_lower: float = 0.005
     lr_factor: float = 1.5
     lr_min: float = 1e-5
-    lr_max: float = 1e-2
+    lr_max: float = 1e-3
     kl_adapt_per_minibatch: bool = True
 
     norm_adv: bool = True
