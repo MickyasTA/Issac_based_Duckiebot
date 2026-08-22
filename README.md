@@ -8,6 +8,11 @@
 [![Clean room](https://img.shields.io/badge/assets-clean--room-brightgreen.svg)](#clean-room-assets)
 [![PPO](https://img.shields.io/badge/PPO-from%20scratch-orange.svg)](#method)
 
+![The trained policy driving the serpentine city in Isaac Sim, with the parallel training grid behind it](assets/isaac_duckie_demo.gif)
+
+*The trained policy driving in Isaac Sim: 20 procedurally generated cities, one vision policy,
+the real DB21 robot model. Full clip: [assets/isaac_duckie_demo.mp4](assets/isaac_duckie_demo.mp4).*
+
 A 1.1 kg differential-drive robot learns to keep a lane from raw camera pixels, in a miniature
 city that is generated procedurally, randomized aggressively, and never contains a single
 downloaded asset. The PPO implementation is written from scratch in PyTorch: no
