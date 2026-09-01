@@ -396,3 +396,61 @@ def test_counts_costs_one_host_transfer_not_seven(count_host_syncs):
     with count_host_syncs() as syncs:
         flags.counts()
         assert syncs() == 1
+
+
+def test_spin_does_not_fire_when_a_closed_lap_returns_to_the_spawn():
+    """The regression: on a closed loop, finishing where you started is success, not a pirouette.
+
+    ``test_spin_does_not_fire_on_a_lap_that_actually_went_somewhere`` drives in a straight line,
+    so displacement from the spawn only ever grows and the old spawn-anchored guard passed it.
+    Every map this project trains and evaluates on is a CLOSED loop, where the last few percent
+    of a lap brings the robot back inside the 0.2 m radius of its spawn with the yaw integral
+    long past 3 pi. The guard therefore fired on the finish line and charged the terminal
+    penalty: measured in the S8 C5 matrix, 117 of 120 episodes died at a median 0.964 laps while
+    holding 3.3 cm lane RMS.
+
+    This walks the 8.12 m loop as a circle through the spawn, with enough corrective steering
+    that the yaw integral passes the limit inside a single lap, and requires silence throughout.
+    """
+    radius = 8.12 / (2.0 * math.pi)
+    steps = 240
+    state = tm.TerminationState(1, CONTROL_DT)
+    state.reset(torch.zeros(1, dtype=torch.long), torch.zeros(1, 2))
+
+    # 4 pi of integrated yaw over one lap: 2 pi of geometry plus that much again of wiggle,
+    # which is what the real rollouts accumulate on a four-corner loop.
+    yaw_rate = torch.tensor([4.0 * math.pi / (steps * CONTROL_DT)])
+    returned = False
+    for i in range(steps + 1):
+        theta = 2.0 * math.pi * i / steps
+        x = torch.tensor([radius * math.sin(theta)])
+        y = torch.tensor([radius * (1.0 - math.cos(theta))])
+        _stall, spin = state.update(torch.tensor([0.5]), yaw_rate, x, y)
+        distance_to_spawn = float(torch.sqrt(x**2 + y**2)[0])
+        if i > steps // 2 and distance_to_spawn < tm.SPIN_MIN_DISPLACEMENT_M:
+            returned = True
+        assert not bool(spin[0]), (
+            f"spin fired at step {i} of a clean lap ({distance_to_spawn:.3f} m from spawn, "
+            f"yaw integral {float(state.yaw_integral[0]):.2f} rad): the guard is punishing success"
+        )
+    assert returned, "the fixture must actually close the loop back onto the spawn"
+
+
+def test_spin_still_fires_when_the_robot_pirouettes_far_from_its_spawn():
+    """The moving anchor must not blind the guard once the robot has driven somewhere.
+
+    The complement of the test above, and the reason the fix moves the anchor rather than simply
+    dropping the displacement clause: a robot that drives away and THEN starts turning on the
+    spot is still spinning, and a guard anchored to the spawn forever would never notice.
+    """
+    state = tm.TerminationState(1, CONTROL_DT)
+    state.reset(torch.zeros(1, dtype=torch.long), torch.zeros(1, 2))
+    for i in range(40):  # drive out to 2 m, well clear of the spawn
+        state.update(torch.tensor([0.5]), torch.tensor([0.0]), torch.tensor([0.05 * (i + 1)]), torch.zeros(1))
+
+    spin = torch.tensor([False])
+    for _ in range(200):  # now turn on the spot, parked at x = 2 m
+        _stall, spin = state.update(torch.zeros(1), torch.tensor([4.0]), torch.tensor([2.0]), torch.zeros(1))
+        if bool(spin[0]):
+            break
+    assert bool(spin[0]), "a pirouette away from the spawn must still be caught"

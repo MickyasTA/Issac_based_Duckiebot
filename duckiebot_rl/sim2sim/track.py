@@ -1058,6 +1058,7 @@ def _tile_geoms(
     geoms: list[ET.Element] = []
     assets: list[ET.Element] = []
     materials: dict[str, str] = {}
+    written_tiles: dict[str, str] = {}
     half = 0.5 * map_spec.tile_size
     for row in range(map_spec.nrows):
         for col in range(map_spec.ncols):
@@ -1072,6 +1073,7 @@ def _tile_geoms(
                     material = f"tile_mat_{len(materials)}"
                     filename = f"tile_{len(materials)}.png"
                     write_png(asset_dir / filename, array)
+                    written_tiles[filename] = f"{kind or 'empty'} ({''.join(sorted(connections))})"
                     assets.append(
                         ET.Element(
                             "texture",
@@ -1108,7 +1110,38 @@ def _tile_geoms(
             else:
                 attrs["rgba"] = " ".join(f"{v:.4g}" for v in (_RGBA_ROAD if road else _RGBA_GRASS))
             geoms.append(ET.Element("geom", attrs))
+    _write_tile_manifest(asset_dir, provider, written_tiles)
     return geoms, assets
+
+
+def _write_tile_manifest(asset_dir: Path, provider: TextureProvider, written_tiles: dict[str, str]) -> None:
+    """Record that these tile PNGs were generated here, for the S3.4 clean-room gate.
+
+    The gate refuses any image it cannot trace to a generator, which is the whole point: an
+    unmanifested PNG cannot be shown to be ours rather than copied from Duckietown, whose assets
+    carry no redistribution grant. The city generator writes its own MANIFEST.yaml; the
+    sim-to-sim scene writes tiles too, so it owes the same proof. Without this the gate fails
+    the moment anyone builds a MuJoCo scene, which is exactly when they need it to pass.
+
+    Args:
+        asset_dir: directory the tiles were written into.
+        provider: the texture provider used, named in the manifest as the proximate generator.
+        written_tiles: mapping of tile filename to the tile kind and connections it renders.
+    """
+    if not written_tiles:
+        return
+    lines = [
+        "generator: duckiebot_rl.sim2sim.track.build_track",
+        f"package: {type(provider).__module__}",
+        f"provider: {type(provider).__name__}",
+        "entries:",
+    ]
+    for filename, description in sorted(written_tiles.items()):
+        lines.append(f"  {filename}:")
+        lines.append("    generator: duckiebot_rl.sim2sim.track._tile_geoms")
+        lines.append(f"    tile: {description}")
+    text = "\n".join(lines) + "\n"
+    (asset_dir / "MANIFEST.yaml").write_text(text, encoding="utf-8")
 
 
 def _wall_geoms(map_spec: MapSpec, city: CityParams) -> list[ET.Element]:

@@ -1,0 +1,188 @@
+{
+  "artifact": {
+    "file": "policy_opset13.onnx",
+    "bytes": 980496,
+    "sha256": "7ca83565b1e96c6d661e6ebf0aef008c3a4013715efa746bb7e6b81e3d01ed3e"
+  },
+  "target": "jetson-nano-trt82",
+  "opset": 13,
+  "exporter": "torchscript-trace",
+  "tensorrt_build_command": "DOCUMENTED, NOT RUN: nvpmodel -m 0 && jetson_clocks && trtexec --onnx=policy_opset13.onnx --fp16 --workspace=512 --saveEngine=policy_nano.plan",
+  "hardware_validation": "NONE. No physical robot exists in this project. This artifact is verified only by offline onnxruntime-vs-torch parity and TorchScript equality.",
+  "io": {
+    "inputs": [
+      {
+        "name": "image",
+        "dtype": "uint8",
+        "shape": [
+          1,
+          48,
+          96,
+          9
+        ],
+        "layout": "NHWC"
+      },
+      {
+        "name": "vec",
+        "dtype": "float32",
+        "shape": [
+          1,
+          8
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "action",
+        "dtype": "float32",
+        "shape": [
+          1,
+          2
+        ]
+      },
+      {
+        "name": "mu",
+        "dtype": "float32",
+        "shape": [
+          1,
+          2
+        ]
+      }
+    ]
+  },
+  "preprocess": {
+    "spec_section": "S4.3",
+    "input_stage": "obs",
+    "graph_input_shape_nhwc": [
+      1,
+      48,
+      96,
+      9
+    ],
+    "graph_input_dtype": "uint8",
+    "color_order": "RGB",
+    "canonical_render": {
+      "width": 192,
+      "height": 128,
+      "fx": 65.98,
+      "fy": 65.98,
+      "cx": 96.0,
+      "cy": 64.0,
+      "hfov_deg": 111.0,
+      "vfov_deg": 88.3
+    },
+    "observation": {
+      "width": 96,
+      "height": 48,
+      "channels": 9
+    },
+    "blur_kernel": [
+      0.00256,
+      0.16555,
+      0.66378,
+      0.16555,
+      0.00256
+    ],
+    "blur_padding": "replicate",
+    "box_downsample": 2,
+    "crop_top_rows_after_downsample": 16,
+    "frame_stack": {
+      "length": 3,
+      "stride_control_steps": 2
+    },
+    "baked_into_graph": {
+      "blur": false,
+      "box_downsample": false,
+      "crop": false,
+      "uint8_quantise": false,
+      "divide_by_255": true,
+      "vec_running_norm": true,
+      "action_scaling": true,
+      "frame_ring_and_stack": false
+    },
+    "robot_side_steps_before_the_graph": [
+      "JPEG decode from camera_node/image/compressed",
+      "BGR to RGB (the classic bug; asserted by the deploy fixture tests)",
+      "Gaussian pre-blur sigma 1.0 px at 640x480",
+      "cv2.remap to the canonical 192x128 pinhole using K_canon",
+      "fixed 5-tap blur",
+      "exact 2x2 box downsample",
+      "16-row crop",
+      "uint8 quantise",
+      "frame ring push",
+      "stack (t, t-2, t-4)"
+    ]
+  },
+  "action": {
+    "outputs": [
+      "action",
+      "mu"
+    ],
+    "action": {
+      "units": [
+        "m/s",
+        "rad/s"
+      ],
+      "names": [
+        "v",
+        "omega"
+      ],
+      "formula": "v = 0.5 * v_max * (clip(mu_v, -1, 1) + 1); omega = omega_max * clip(mu_omega, -1, 1)",
+      "v_max": 0.6,
+      "omega_max": 4.0,
+      "ros_message": "duckietown_msgs/Twist2DStamped on car_cmd_switch_node/cmd at 15 Hz"
+    },
+    "mu": {
+      "units": [
+        "dimensionless",
+        "dimensionless"
+      ],
+      "note": "raw unclipped Gaussian mean in the [-1, 1] action box; the sim-to-sim harness consumes this and re-runs the S5.3 action path itself"
+    },
+    "deterministic": true,
+    "control_rate_hz": 15.0
+  },
+  "normalisation": {
+    "vec_mean": [
+      0.4252288341522217,
+      -0.0044686198234558105,
+      0.4239543676376343,
+      -0.004434517584741116,
+      13.046290397644043,
+      13.013812065124512,
+      -0.013464605435729027,
+      0.41403689980506897
+    ],
+    "vec_std": [
+      0.4892253279685974,
+      0.5878997445106506,
+      0.48868852853775024,
+      0.5867072939872742,
+      4.715634346008301,
+      5.136728286743164,
+      1.8157966136932373,
+      0.12632137537002563
+    ],
+    "clip": 5.0,
+    "baked_as_constants": true
+  },
+  "provenance": {
+    "spec_version": "v2",
+    "repo_commit": "ff7595ad3212e51490ecc1bf8ec066d3a345985f",
+    "exported_at_utc": "2026-09-01T04:05:14+00:00",
+    "torch_version": "2.7.0+cu128",
+    "python_version": "3.11.4",
+    "onnx_version": "1.18.0"
+  },
+  "checkpoint": {
+    "path": "training_results\\20260821T173917Z_lanefollow_seed0_leaky_seed0\\model_best.pth",
+    "sha256": "8e72dc09d12e6a40d2a9891c6eefa6d33a8faece17bc48412c87b04a38b8e053",
+    "iteration": 100,
+    "global_step": 204800,
+    "seed": 0,
+    "train_commit": "fb312dd1e2b157220db28cd856732785398ca25f",
+    "config_hash": "aed7b55a238ab059",
+    "spec_version": "SPEC_V2",
+    "vec_norm_found": true
+  }
+}

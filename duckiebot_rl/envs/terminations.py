@@ -16,10 +16,15 @@ S5.5 in full
    backstop, which is the decision critic item H asked for explicitly.
 3. **rollover** - ``|roll| > 30 deg`` or ``|pitch| > 30 deg``.
 4. **stall** - body speed below 0.03 m/s continuously for longer than 2 s.
-5. **spin** - integrated ``|yaw rate|`` beyond ``3 * pi`` while the net displacement from the
-   spawn point is under 0.2 m. Both halves are required: a lap of a small loop legitimately
-   integrates several turns of yaw, so the displacement clause is what separates "drove around"
-   from "span on the spot".
+5. **spin** - integrated ``|yaw rate|`` beyond ``3 * pi`` without ever getting 0.2 m away from
+   a MOVING anchor, which is reset to the current position every time the robot does get that
+   far. Both halves are required: a lap of a small loop legitimately integrates several turns
+   of yaw, so the displacement clause is what separates "drove around" from "span on the spot".
+   The anchor used to be the spawn point, which inverted the guard on exactly the maps this
+   project runs: every map is a closed loop, so finishing a lap returns the robot to within
+   0.2 m of its spawn with the yaw integral long past the limit. It fired on success (measured
+   in the S8 C5 matrix: 117 of 120 episodes killed at a median 0.964 laps while holding 3.3 cm
+   lane RMS) and charged the terminal penalty for it.
 
 ``truncated`` is the 450-step horizon and nothing else. The two flags are returned separately
 and must stay separate all the way into GAE: terminated zeroes the bootstrap, truncated
@@ -281,6 +286,9 @@ class TerminationState:
         self.stall_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.yaw_integral = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.spawn_xy = torch.zeros(self.num_envs, 2, dtype=torch.float32, device=self.device)
+        # anchor for the spin guard: the last position the robot got spin_min_displacement_m
+        # away from. Distinct from spawn_xy, which stays where the episode began.
+        self.spin_ref_xy = torch.zeros(self.num_envs, 2, dtype=torch.float32, device=self.device)
 
     @property
     def stall_step_limit(self) -> int:
@@ -301,6 +309,7 @@ class TerminationState:
         self.yaw_integral[ids] = 0.0
         if spawn_xy is not None:
             self.spawn_xy[ids] = spawn_xy.to(device=self.device, dtype=self.spawn_xy.dtype)
+            self.spin_ref_xy[ids] = self.spawn_xy[ids]
 
     def update(
         self,
@@ -324,9 +333,22 @@ class TerminationState:
         self.stall_steps = torch.where(stalled_now, self.stall_steps + 1, torch.zeros_like(self.stall_steps))
         stall = self.stall_steps > self.stall_step_limit
 
+        # The reference point MOVES. Measuring displacement from the spawn made this guard fire
+        # on success: every training and evaluation map is a closed loop, so a robot that drives
+        # a lap comes back to within 0.2 m of where it started while its integrated turning has
+        # long passed 3 pi. Measured in the S8 C5 matrix before this fix: 117 of 120 episodes
+        # ended in "spin" at a median of 0.964 laps and 3.3 cm lane RMS, i.e. the guard killed
+        # the robot 4% short of the finish line and charged it the terminal penalty for it.
+        # Anchoring instead to the last place the robot actually got 0.2 m away from keeps the
+        # original meaning (turning a lot while going nowhere), catches a spin that starts at
+        # any point in the episode rather than only near the spawn, and cannot fire on a lap.
         self.yaw_integral = self.yaw_integral + yaw_rate.abs() * self.control_dt
-        displacement = torch.sqrt((x - self.spawn_xy[:, 0]) ** 2 + (y - self.spawn_xy[:, 1]) ** 2)
-        spin = (self.yaw_integral > self.spin_yaw_limit_rad) & (displacement < self.spin_min_displacement_m)
+        displacement = torch.sqrt((x - self.spin_ref_xy[:, 0]) ** 2 + (y - self.spin_ref_xy[:, 1]) ** 2)
+        escaped = displacement >= self.spin_min_displacement_m
+        self.yaw_integral = torch.where(escaped, torch.zeros_like(self.yaw_integral), self.yaw_integral)
+        self.spin_ref_xy[:, 0] = torch.where(escaped, x, self.spin_ref_xy[:, 0])
+        self.spin_ref_xy[:, 1] = torch.where(escaped, y, self.spin_ref_xy[:, 1])
+        spin = self.yaw_integral > self.spin_yaw_limit_rad
         return stall, spin
 
     def evaluate(
@@ -387,12 +409,14 @@ class TerminationState:
         """Serialise the counters for a checkpoint.
 
         Returns:
-            ``{"stall_steps", "yaw_integral", "spawn_xy"}`` as CPU-mappable tensors.
+            ``{"stall_steps", "yaw_integral", "spawn_xy", "spin_ref_xy"}`` as CPU-mappable
+            tensors.
         """
         return {
             "stall_steps": self.stall_steps.clone(),
             "yaw_integral": self.yaw_integral.clone(),
             "spawn_xy": self.spawn_xy.clone(),
+            "spin_ref_xy": self.spin_ref_xy.clone(),
         }
 
     def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
@@ -410,3 +434,6 @@ class TerminationState:
         self.stall_steps.copy_(state["stall_steps"].to(self.stall_steps.device))
         self.yaw_integral.copy_(state["yaw_integral"].to(self.yaw_integral.device))
         self.spawn_xy.copy_(state["spawn_xy"].to(self.spawn_xy.device))
+        # checkpoints written before the moving anchor existed carry no spin_ref_xy; falling
+        # back to spawn_xy reproduces their behaviour for one step and self-corrects after it
+        self.spin_ref_xy.copy_(state.get("spin_ref_xy", state["spawn_xy"]).to(self.spin_ref_xy.device))
