@@ -83,7 +83,7 @@ TorchScript:
 import torch
 
 policy = torch.jit.load("policy_traced.pt").eval()
-image = torch.zeros(1, 48, 96, 9, dtype=torch.uint8)   # your preprocessed stack
+image = torch.zeros(1, 48, 96, 9, dtype=torch.uint8)  # your preprocessed stack
 vec = torch.zeros(1, 8, dtype=torch.float32)
 with torch.no_grad():
     action, mu = policy(image, vec)
