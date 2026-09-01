@@ -13,6 +13,11 @@
 *The trained policy driving in Isaac Sim: 20 procedurally generated cities, one vision policy,
 the real DB21 robot model. Full clip: [assets/isaac_duckie_demo.mp4](assets/isaac_duckie_demo.mp4).*
 
+**Pretrained policy included.** [`models/lanefollow_v1/`](models/lanefollow_v1/) ships the trained
+weights, TorchScript, and ONNX for both Jetson targets, with the full input/output contract and
+runnable inference snippets. Measured in MuJoCo, a different physics engine and renderer than it
+trained in: **18.29 m median, 2.18 laps, 3.28 cm lane RMS, 100% success** over 120 episodes.
+
 A 1.1 kg differential-drive robot learns to keep a lane from raw camera pixels, in a miniature
 city that is generated procedurally, randomized aggressively, and never contains a single
 downloaded asset. The PPO implementation is written from scratch in PyTorch: no
