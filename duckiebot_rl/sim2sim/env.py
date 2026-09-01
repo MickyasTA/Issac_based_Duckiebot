@@ -595,6 +595,7 @@ class MjDuckiebotEnv:
         self._lateral: list[float] = []
         self._yaw_integral = 0.0
         self._start_xy = np.zeros(2)
+        self._spin_ref_xy = np.zeros(2)
         self._stall_steps = 0
         self._prev_gap = 0.0
         self._loop_length = float("nan")
@@ -633,6 +634,7 @@ class MjDuckiebotEnv:
         self._mj.mj_forward(self.model, self.data)
 
         self._start_xy = np.array([x, y])
+        self._spin_ref_xy = np.array([x, y], dtype=float)
         self._prev_wheel_pos = self._wheel_positions()
         self._encoder_speed[:] = 0.0
         query = self.lane.query(x, y, yaw)  # free global match: this is the spawn
@@ -897,9 +899,18 @@ class MjDuckiebotEnv:
             self._stall_steps = 0
         if self._stall_steps * self.control_dt > self.cfg.stall_timeout_s:
             return True, "stall"
+        # Moving anchor, matching duckiebot_rl.envs.terminations (S8.3 parity). Anchoring to the
+        # spawn made this fire on success: every map is a closed loop, so a finished lap returns
+        # the robot to within 0.2 m of where it started with the yaw integral long past 3 pi.
+        # Measured here before the fix: 117 of 120 C5 episodes "span" at 0.964 laps and 3.3 cm
+        # lane RMS. Resetting the anchor and the integral whenever the robot actually gets that
+        # far away keeps the meaning (turning a lot while going nowhere) and cannot fire on a lap.
         self._yaw_integral += abs(self.data.qvel[5]) * self.control_dt
-        displacement = float(np.linalg.norm(np.array([x, y]) - self._start_xy))
-        if self._yaw_integral > 3.0 * math.pi and displacement < 0.2:
+        displacement = float(np.linalg.norm(np.array([x, y]) - self._spin_ref_xy))
+        if displacement >= 0.2:
+            self._spin_ref_xy = np.array([x, y], dtype=float)
+            self._yaw_integral = 0.0
+        elif self._yaw_integral > 3.0 * math.pi:
             return True, "spin"
         return False, "timeout"
 

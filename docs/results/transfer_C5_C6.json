@@ -234,17 +234,17 @@
   "budgets": {
     "C5": {
       "episodes": 120,
-      "seconds_per_episode": 5.252789855003357,
+      "seconds_per_episode": 4.0622299909591675,
       "workers": 1,
       "allowance_s": 540.0,
-      "elapsed_s": 465.06056904792786
+      "elapsed_s": 487.32406973838806
     },
     "C6": {
       "episodes": 120,
-      "seconds_per_episode": 4.359902501106262,
+      "seconds_per_episode": 5.903796076774597,
       "workers": 1,
       "allowance_s": 540.0,
-      "elapsed_s": 527.183929681778
+      "elapsed_s": 619.4454617500305
     }
   },
   "records": [

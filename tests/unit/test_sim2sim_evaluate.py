@@ -125,3 +125,27 @@ def test_bootstrap_ci_of_an_empty_sample_is_nan(values: list[float]) -> None:
     """An all-NaN or empty metric yields NaN bounds rather than an exception."""
     low, high = _evaluate._bootstrap_median_ci(values, np.random.default_rng(0))
     assert low != low and high != high
+
+
+def test_mujoco_spin_guard_uses_a_moving_anchor_like_the_isaac_one() -> None:
+    """S8.3 parity: the twin's spin guard must not fire on a finished lap either.
+
+    The Isaac guard and this one are separate implementations of the same S5.5 condition, so a
+    fix to one is only half a fix. Anchoring to the spawn made both fire on success, and it was
+    THIS copy that produced the measured artifact: 117 of 120 C5 episodes reported as "spin" at
+    a median 0.964 laps and 3.3 cm lane RMS, which collapsed the headline transfer number from
+    18.3 m (2.07 laps, 100% success) to 7.96 m. Asserting on the source keeps the two in step
+    without booting a simulator.
+    """
+    from pathlib import Path
+
+    source = Path("duckiebot_rl/sim2sim/env.py").read_text(encoding="utf-8")
+    assert "_spin_ref_xy" in source, "the MuJoCo spin guard must use the moving anchor"
+    assert "self._spin_ref_xy)" in source or "self._spin_ref_xy," in source, (
+        "displacement must be measured from the moving anchor, not the spawn"
+    )
+    spin_block = source[source.index("_yaw_integral += abs") : source.index('return True, "spin"')]
+    assert "_start_xy" not in spin_block, (
+        "the spin guard still measures displacement from the spawn; on a closed loop that fires "
+        "on lap completion, which is the regression this pins"
+    )
