@@ -305,3 +305,40 @@ def test_track_scene_has_exactly_one_collidable_surface() -> None:
         f"the only collidable world geom must be the ground plane, found {names}; tile-edge "
         f"contacts are a divergence source Isaac does not have"
     )
+
+
+def test_track_textures_load_through_both_mujoco_entry_points() -> None:
+    """``texturedir`` must be absolute, because the two compile paths resolve it differently.
+
+    The regression this pins cost the whole S8 harness a day. ``build_track`` used to set
+    ``<compiler texturedir>`` to the asset directory as given. ``MjModel.from_xml_path``
+    resolves a RELATIVE texturedir against the directory holding the XML, and the scene XML is
+    written into that same asset directory, so the compiler looked under
+    ``<asset_dir>/<asset_dir>/tile_0.png`` and failed with "Error opening file" while six
+    perfectly valid PNGs sat next to the XML. The obvious repair, ``texturedir="."``, fixes that
+    path and breaks the other one: ``MjModel.from_xml_string`` has no file context and resolves
+    against the process CWD, which is where ``MjDuckiebotEnv`` compiles every scene it runs.
+
+    Only an absolute path is correct for both, so both are exercised here.
+    """
+    import re
+    import tempfile
+    from pathlib import Path
+
+    from duckiebot_rl.sim2sim import track as _track
+
+    with tempfile.TemporaryDirectory() as tmp:
+        scene = _track.build_track(_track.LOOP_5X5, asset_dir=tmp)
+        texturedir = re.search(r'texturedir="([^"]*)"', scene.xml).group(1)
+        assert Path(texturedir).is_absolute(), (
+            f"texturedir {texturedir!r} must be absolute; a relative value resolves against "
+            "different bases in from_xml_path and from_xml_string"
+        )
+
+        from_string = mujoco.MjModel.from_xml_string(scene.xml)
+
+        xml_path = Path(tmp) / "track.xml"
+        xml_path.write_text(scene.xml, encoding="utf-8")
+        from_path = mujoco.MjModel.from_xml_path(str(xml_path))
+
+    assert from_string.ntex == from_path.ntex > 0, "both entry points must load the tile textures"

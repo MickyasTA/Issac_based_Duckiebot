@@ -1228,7 +1228,14 @@ def build_track(
     directory = Path(asset_dir)
     directory.mkdir(parents=True, exist_ok=True)
     cfg = cfg if cfg is not None else _mjcf.MjcfCfg.from_shared()
-    cfg.texturedir = str(directory)
+    # <compiler texturedir> must be ABSOLUTE, because this scene is compiled through two
+    # different MuJoCo entry points that resolve a relative value against different bases:
+    # `from_xml_path` resolves it against the directory of the XML (so a value of `directory`
+    # looked under `<directory>/<directory>/tile_N.png`, the failure that blocked the whole S8
+    # harness with "Error opening file" while the tiles sat there valid), and
+    # `from_xml_string` has no file context at all, so it resolves against the process CWD
+    # (where "." finds nothing). An absolute path is used verbatim by both.
+    cfg.texturedir = str(directory.resolve())
 
     if texture_provider is None:
         try:
